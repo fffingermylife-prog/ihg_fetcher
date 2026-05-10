@@ -1,31 +1,15 @@
 /**
  * IHG Calendar Price Fetcher - 浏览器控制台版本
- * 获取每天最低现金价格
+ * 获取每天最低现金价格 + 积分价格
  *
  * 使用方法:
  * 1. 在浏览器中打开 IHG 酒店页面 (如 ihg.com)
  * 2. 打开 DevTools (F12) -> Console
  * 3. 复制粘贴此脚本并运行
  *
- * 优势: 直接利用浏览器已有的 Cookie 和会话，无需额外配置
- *
- * 实际 API 响应结构:
- * {
- *   "data": {
- *     "hotels": [{
- *       "hotel": { "brandCode": "IC", "hotelMnemonic": "BKKHB", "propertyCurrency": "THB" },
- *       "calendar": [{
- *         "start": "2026-05-09",
- *         "end": "2026-05-09",
- *         "lowestRate": {
- *           "totalAmount": "6270.00",
- *           "averageDailyAmount": "6270.00",
- *           "currency": "THB"
- *         }
- *       }]
- *     }]
- *   }
- * }
+ * API 响应结构:
+ * 现金: data.hotels[].calendar[].lowestRate.totalAmount
+ * 积分: data.hotels[].calendar[].offers[].totalPoints (ratePlanCode = IVAN*)
  */
 
 (async function IHGCalendarFetcher() {
@@ -33,22 +17,21 @@
 
     // ============ 配置 ============
     const CONFIG = {
-        // 要查询的酒店代码列表
         hotelCodes: [
             "BKKHB",  // InterContinental Bangkok
             // 添加更多酒店代码...
         ],
 
-        // 日期范围 (API 支持最多约2个月)
         startDate: "2026-05-10",
         endDate: "2026-07-10",
 
-        // 住宿配置
         lengthOfStay: 1,
         adults: 1,
 
-        // API Key
         apiKey: "se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y",
+
+        // 积分 rate plan codes
+        pointsRatePlanCodes: ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"],
 
         // 请求间隔(毫秒)
         delay: 2000,
@@ -69,16 +52,13 @@
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    async function fetchCalendar(hotelCode) {
+    function buildPayload(hotelCode, pointsMode = false) {
         const payload = {
             hotelMnemonics: [hotelCode],
             startDate: CONFIG.startDate,
             endDate: CONFIG.endDate,
             lengthOfStay: CONFIG.lengthOfStay,
-            guestCounts: [{
-                otaCode: "AQC10",
-                count: CONFIG.adults
-            }],
+            guestCounts: [{ otaCode: "AQC10", count: CONFIG.adults }],
             options: {
                 includeSellStrategy: "followChannel",
                 returnAmountsAfterTaxForLowestOffer: true,
@@ -87,6 +67,17 @@
                 identifyLowestOfferPerRatePlan: true,
             }
         };
+
+        if (pointsMode) {
+            payload.rates = { ratePlanCodes: CONFIG.pointsRatePlanCodes };
+        }
+
+        return payload;
+    }
+
+    async function fetchCalendar(hotelCode, pointsMode = false) {
+        const payload = buildPayload(hotelCode, pointsMode);
+        const modeStr = pointsMode ? "积分" : "现金";
 
         const headers = {
             "accept": "application/json, text/plain, */*",
@@ -107,83 +98,130 @@
 
             if (response.ok) {
                 const data = await response.json();
-                console.log(`✅ ${hotelCode}: 获取成功`);
+                console.log(`✅ ${hotelCode} (${modeStr}): 获取成功`);
                 return { hotelCode, data, success: true };
             } else {
-                console.error(`❌ ${hotelCode}: HTTP ${response.status}`);
+                console.error(`❌ ${hotelCode} (${modeStr}): HTTP ${response.status}`);
                 return { hotelCode, error: `HTTP ${response.status}`, success: false };
             }
         } catch (err) {
-            console.error(`❌ ${hotelCode}: ${err.message}`);
+            console.error(`❌ ${hotelCode} (${modeStr}): ${err.message}`);
             return { hotelCode, error: err.message, success: false };
         }
     }
 
-    function parseCalendarData(result) {
-        /**
-         * 解析响应，提取每天最低价格
-         * 路径: data.hotels[].calendar[].lowestRate.totalAmount
-         */
+    function parseCashResponse(result) {
+        /** 解析现金价格: data.hotels[].calendar[].lowestRate.totalAmount */
         const prices = [];
         const { hotelCode, data } = result;
-
-        if (!data || !data.data) {
-            console.warn(`⚠️ ${hotelCode}: 响应中无 data 字段`);
-            return prices;
-        }
+        if (!data || !data.data) return prices;
 
         const hotels = data.data.hotels || [];
-
         for (const hotelEntry of hotels) {
-            const hotelInfo = hotelEntry.hotel || {};
-            const code = hotelInfo.hotelMnemonic || hotelCode;
-            const brandCode = hotelInfo.brandCode || "";
-            const propertyCurrency = hotelInfo.propertyCurrency || "";
+            const info = hotelEntry.hotel || {};
+            const code = info.hotelMnemonic || hotelCode;
+            const brandCode = info.brandCode || "";
+            const currency = info.propertyCurrency || "";
 
-            const calendar = hotelEntry.calendar || [];
-
-            for (const day of calendar) {
+            for (const day of (hotelEntry.calendar || [])) {
                 const date = day.start || "";
-                const lowestRate = day.lowestRate || null;
-
-                if (lowestRate) {
-                    prices.push({
-                        hotel_code: code,
-                        brand_code: brandCode,
-                        date: date,
-                        lowest_price: parseFloat(lowestRate.totalAmount) || null,
-                        average_daily_price: parseFloat(lowestRate.averageDailyAmount) || null,
-                        currency: lowestRate.currency || propertyCurrency,
-                    });
-                } else {
-                    // 当天无可用房间
-                    prices.push({
-                        hotel_code: code,
-                        brand_code: brandCode,
-                        date: date,
-                        lowest_price: null,
-                        average_daily_price: null,
-                        currency: propertyCurrency,
-                    });
-                }
+                const lowestRate = day.lowestRate;
+                prices.push({
+                    hotel_code: code,
+                    brand_code: brandCode,
+                    date: date,
+                    cash_price: lowestRate ? parseFloat(lowestRate.totalAmount) || null : null,
+                    cash_currency: lowestRate ? (lowestRate.currency || currency) : currency,
+                });
             }
         }
-
-        if (prices.length === 0) {
-            console.warn(`⚠️ ${hotelCode}: 未解析出价格数据`);
-            console.log("原始响应键:", Object.keys(data));
-        }
-
         return prices;
     }
 
-    function exportToCSV(allPrices) {
-        if (allPrices.length === 0) {
-            console.warn("没有数据可导出");
-            return;
+    function parsePointsResponse(result) {
+        /**
+         * 解析积分价格: data.hotels[].calendar[].offers[].totalPoints
+         * 只取 ratePlanCode 为 IVAN* 或 isRewardNight=true 的 offer
+         */
+        const prices = [];
+        const { hotelCode, data } = result;
+        if (!data || !data.data) return prices;
+
+        const hotels = data.data.hotels || [];
+        for (const hotelEntry of hotels) {
+            const info = hotelEntry.hotel || {};
+            const code = info.hotelMnemonic || hotelCode;
+            const brandCode = info.brandCode || "";
+
+            // 找出 reward rate plan codes
+            const rewardCodes = new Set();
+            for (const rp of (hotelEntry.ratePlans || [])) {
+                if (rp.isRewardNight) rewardCodes.add(rp.code);
+            }
+
+            for (const day of (hotelEntry.calendar || [])) {
+                const date = day.start || "";
+                const offers = day.offers || [];
+
+                // 找最低积分
+                let lowestPoints = null;
+                for (const offer of offers) {
+                    const rpCode = offer.ratePlanCode || "";
+                    const isPointsOffer = rewardCodes.has(rpCode) || rpCode.startsWith("IVAN");
+
+                    if (isPointsOffer && offer.totalPoints != null) {
+                        const pts = parseFloat(offer.totalPoints);
+                        if (!isNaN(pts) && (lowestPoints === null || pts < lowestPoints)) {
+                            lowestPoints = pts;
+                        }
+                    }
+                }
+
+                prices.push({
+                    hotel_code: code,
+                    brand_code: brandCode,
+                    date: date,
+                    points_price: lowestPoints,
+                });
+            }
+        }
+        return prices;
+    }
+
+    function mergePrices(cashPrices, pointsPrices) {
+        /** 合并现金和积分价格 */
+        const cashMap = {};
+        for (const row of cashPrices) {
+            cashMap[`${row.hotel_code}_${row.date}`] = row;
+        }
+        const pointsMap = {};
+        for (const row of pointsPrices) {
+            pointsMap[`${row.hotel_code}_${row.date}`] = row;
         }
 
-        const headers = ["hotel_code", "brand_code", "date", "lowest_price", "average_daily_price", "currency"];
+        const allKeys = new Set([...Object.keys(cashMap), ...Object.keys(pointsMap)]);
+        const merged = [];
+
+        for (const key of [...allKeys].sort()) {
+            const cash = cashMap[key] || {};
+            const points = pointsMap[key] || {};
+            merged.push({
+                hotel_code: cash.hotel_code || points.hotel_code,
+                brand_code: cash.brand_code || points.brand_code || "",
+                date: cash.date || points.date,
+                cash_price: cash.cash_price || null,
+                cash_currency: cash.cash_currency || "",
+                points_price: points.points_price || null,
+            });
+        }
+
+        return merged;
+    }
+
+    function exportToCSV(allPrices) {
+        if (allPrices.length === 0) return;
+
+        const headers = ["hotel_code", "brand_code", "date", "cash_price", "cash_currency", "points_price"];
         const csvLines = [headers.join(",")];
 
         for (const row of allPrices) {
@@ -191,9 +229,9 @@
                 row.hotel_code,
                 row.brand_code,
                 row.date,
-                row.lowest_price !== null ? row.lowest_price : "",
-                row.average_daily_price !== null ? row.average_daily_price : "",
-                row.currency,
+                row.cash_price !== null ? row.cash_price : "",
+                row.cash_currency,
+                row.points_price !== null ? row.points_price : "",
             ].join(","));
         }
 
@@ -205,12 +243,11 @@
         link.download = `ihg_prices_${new Date().toISOString().slice(0, 10)}.csv`;
         link.click();
         URL.revokeObjectURL(url);
-        console.log(`📁 CSV 文件已下载 (${allPrices.length} 条记录)`);
+        console.log(`📁 CSV 已下载 (${allPrices.length} 条)`);
     }
 
-    function exportToJSON(allResults) {
-        const jsonStr = JSON.stringify(allResults, null, 2);
-        const blob = new Blob([jsonStr], { type: "application/json" });
+    function exportToJSON(data) {
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
@@ -221,25 +258,34 @@
     }
 
     // ============ 主流程 ============
-    console.log("🏨 IHG Calendar Price Fetcher - 每日最低价格");
+    console.log("🏨 IHG Calendar Price Fetcher - 现金 + 积分");
     console.log("================================================");
     console.log(`酒店数量: ${CONFIG.hotelCodes.length}`);
     console.log(`日期范围: ${CONFIG.startDate} ~ ${CONFIG.endDate}`);
     console.log("================================================\n");
 
-    const allResults = [];
-    const allPrices = [];
+    const allCashPrices = [];
+    const allPointsPrices = [];
+    const allRawResults = [];
 
     for (let i = 0; i < CONFIG.hotelCodes.length; i++) {
         const code = CONFIG.hotelCodes[i];
-        console.log(`[${i + 1}/${CONFIG.hotelCodes.length}] 获取 ${code}...`);
+        console.log(`\n[${i + 1}/${CONFIG.hotelCodes.length}] 酒店: ${code}`);
 
-        const result = await fetchCalendar(code);
-        allResults.push(result);
+        // 获取现金价格
+        const cashResult = await fetchCalendar(code, false);
+        allRawResults.push({ type: "cash", ...cashResult });
+        if (cashResult.success) {
+            allCashPrices.push(...parseCashResponse(cashResult));
+        }
 
-        if (result.success) {
-            const prices = parseCalendarData(result);
-            allPrices.push(...prices);
+        await sleep(CONFIG.delay);
+
+        // 获取积分价格
+        const pointsResult = await fetchCalendar(code, true);
+        allRawResults.push({ type: "points", ...pointsResult });
+        if (pointsResult.success) {
+            allPointsPrices.push(...parsePointsResponse(pointsResult));
         }
 
         if (i < CONFIG.hotelCodes.length - 1) {
@@ -247,32 +293,35 @@
         }
     }
 
+    // 合并
+    const mergedPrices = mergePrices(allCashPrices, allPointsPrices);
+
     // 输出汇总
     console.log("\n================================================");
-    console.log(`📊 汇总: 成功 ${allResults.filter(r => r.success).length}/${CONFIG.hotelCodes.length} 个酒店`);
-    console.log(`📊 共 ${allPrices.length} 条每日价格记录`);
+    console.log(`📊 共 ${mergedPrices.length} 条日价格记录`);
 
-    // 打印表格预览
-    if (allPrices.length > 0) {
+    if (mergedPrices.length > 0) {
         console.log("\n📋 价格预览 (前15条):");
-        console.table(allPrices.slice(0, 15).map(p => ({
+        console.table(mergedPrices.slice(0, 15).map(p => ({
             酒店: p.hotel_code,
             日期: p.date,
-            最低价: p.lowest_price,
-            货币: p.currency,
+            现金价: p.cash_price,
+            货币: p.cash_currency,
+            积分价: p.points_price,
         })));
 
-        // 导出
-        exportToCSV(allPrices);
+        exportToCSV(mergedPrices);
     }
 
-    exportToJSON(allResults);
+    exportToJSON(allRawResults);
 
     // 全局变量
-    window.__IHG_RESULTS = allResults;
-    window.__IHG_PRICES = allPrices;
-    console.log("\n💡 数据已存储到 window.__IHG_PRICES");
-    console.log("   查看全部: console.table(window.__IHG_PRICES)");
+    window.__IHG_PRICES = mergedPrices;
+    window.__IHG_RAW = allRawResults;
+    console.log("\n💡 数据已存储:");
+    console.log("   window.__IHG_PRICES  - 合并后的每日价格");
+    console.log("   window.__IHG_RAW     - 原始响应数据");
+    console.log("   查看: console.table(window.__IHG_PRICES)");
 
-    return { results: allResults, prices: allPrices };
+    return mergedPrices;
 })();

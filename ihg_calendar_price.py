@@ -1,33 +1,21 @@
 """
 IHG Hotel Calendar Price Fetcher
-获取 IHG 旗下酒店的日历房每天最低现金价格
+获取 IHG 旗下酒店的日历房每天最低现金价格和积分价格
 
-实际 API 响应结构:
-{
-    "data": {
-        "hotels": [{
-            "hotel": { "brandCode": "IC", "hotelMnemonic": "BKKHB", "propertyCurrency": "THB" },
-            "calendar": [{
-                "start": "2026-05-09",
-                "end": "2026-05-09",
-                "lowestRate": {
-                    "totalAmount": "6270.00",
-                    "averageDailyAmount": "6270.00",
-                    "currency": "THB",
-                    "refIds": [30, 34]
-                }
-            }, ...]
-        }]
-    }
-}
+API 端点: POST https://apis.ihg.com/availability/v1/calendar
+
+现金价格响应结构:
+    data.hotels[].calendar[].lowestRate.totalAmount
+
+积分价格响应结构 (payload 加 rates.ratePlanCodes):
+    data.hotels[].calendar[].offers[].totalPoints
+    (ratePlanCode 为 IVAN* 的 offer)
 
 使用方法:
 1. 在浏览器中打开 IHG 酒店页面，通过 DevTools 获取有效的 cookie
 2. 将 cookie 填入 COOKIES 变量
 3. 修改 HOTEL_CODES 列表添加你需要查询的酒店代码
 4. 运行脚本: python ihg_calendar_price.py
-
-API 端点: POST https://apis.ihg.com/availability/v1/calendar
 """
 
 import requests
@@ -35,7 +23,6 @@ import json
 import csv
 import uuid
 import time
-from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 
@@ -45,11 +32,9 @@ from typing import List, Dict, Optional
 API_KEY = "se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y"
 
 # 需要从浏览器 DevTools 中获取的 Cookie
-# 打开 IHG 网站 -> F12 -> Network -> 找到 calendar 请求 -> 复制 Cookie 头
 COOKIES = ""  # 粘贴你的完整 cookie 字符串
 
 # 要查询的酒店代码列表
-# 可以从 IHG 网站 URL 中获取，如 qSlH=BKKHB 表示酒店代码为 BKKHB
 HOTEL_CODES = [
     "BKKHB",   # InterContinental Bangkok
     # 添加更多酒店代码...
@@ -67,6 +52,9 @@ ADULTS = 1
 
 # 请求间隔(秒)，避免被限流
 REQUEST_DELAY = 2
+
+# 积分房 Rate Plan Codes
+POINTS_RATE_PLAN_CODES = ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"]
 
 # ============ 配置结束 ============
 
@@ -98,9 +86,7 @@ class IHGCalendarFetcher:
 
     def _generate_ids(self) -> tuple:
         """生成会话ID和事务ID"""
-        session_id = str(uuid.uuid4())
-        transaction_id = str(uuid.uuid4())
-        return session_id, transaction_id
+        return str(uuid.uuid4()), str(uuid.uuid4())
 
     def build_payload(
         self,
@@ -109,9 +95,15 @@ class IHGCalendarFetcher:
         end_date: str,
         length_of_stay: int = 1,
         adults: int = 1,
+        points_mode: bool = False,
     ) -> dict:
-        """构建请求体"""
-        return {
+        """
+        构建请求体
+
+        参数:
+            points_mode: True 则添加 rates.ratePlanCodes 获取积分价格
+        """
+        payload = {
             "hotelMnemonics": hotel_codes,
             "startDate": start_date,
             "endDate": end_date,
@@ -131,6 +123,13 @@ class IHGCalendarFetcher:
             }
         }
 
+        if points_mode:
+            payload["rates"] = {
+                "ratePlanCodes": POINTS_RATE_PLAN_CODES
+            }
+
+        return payload
+
     def fetch_calendar(
         self,
         hotel_codes: List[str],
@@ -138,6 +137,7 @@ class IHGCalendarFetcher:
         end_date: str,
         length_of_stay: int = 1,
         adults: int = 1,
+        points_mode: bool = False,
     ) -> Optional[dict]:
         """获取日历价格数据"""
         session_id, transaction_id = self._generate_ids()
@@ -148,10 +148,11 @@ class IHGCalendarFetcher:
         }
 
         payload = self.build_payload(
-            hotel_codes, start_date, end_date, length_of_stay, adults
+            hotel_codes, start_date, end_date, length_of_stay, adults, points_mode
         )
 
-        print(f"[*] 请求酒店: {hotel_codes}")
+        mode_str = "积分" if points_mode else "现金"
+        print(f"[*] 请求酒店: {hotel_codes} ({mode_str})")
         print(f"    日期范围: {start_date} ~ {end_date}")
 
         try:
@@ -175,6 +176,28 @@ class IHGCalendarFetcher:
             print(f"[-] 请求异常: {e}")
             return None
 
+    def fetch_hotel_both_prices(
+        self,
+        hotel_code: str,
+        start_date: str,
+        end_date: str,
+        length_of_stay: int = 1,
+        adults: int = 1,
+        delay: float = 2.0,
+    ) -> Dict[str, Optional[dict]]:
+        """获取单个酒店的现金和积分价格"""
+        cash_data = self.fetch_calendar(
+            [hotel_code], start_date, end_date, length_of_stay, adults, points_mode=False
+        )
+
+        time.sleep(delay)
+
+        points_data = self.fetch_calendar(
+            [hotel_code], start_date, end_date, length_of_stay, adults, points_mode=True
+        )
+
+        return {"cash": cash_data, "points": points_data}
+
     def fetch_multiple_hotels(
         self,
         hotel_codes: List[str],
@@ -182,111 +205,190 @@ class IHGCalendarFetcher:
         end_date: str,
         length_of_stay: int = 1,
         adults: int = 1,
-        batch_size: int = 1,
         delay: float = 2.0,
-    ) -> List[dict]:
-        """批量获取多个酒店的价格数据"""
+    ) -> List[Dict[str, Optional[dict]]]:
+        """批量获取多个酒店的现金+积分价格"""
         results = []
 
-        for i in range(0, len(hotel_codes), batch_size):
-            batch = hotel_codes[i:i + batch_size]
-            data = self.fetch_calendar(batch, start_date, end_date, length_of_stay, adults)
-            if data:
-                results.append(data)
+        for i, hotel_code in enumerate(hotel_codes):
+            print(f"\n{'='*40}")
+            print(f"[{i+1}/{len(hotel_codes)}] 酒店: {hotel_code}")
+            print(f"{'='*40}")
 
-            if i + batch_size < len(hotel_codes):
+            data = self.fetch_hotel_both_prices(
+                hotel_code, start_date, end_date, length_of_stay, adults, delay
+            )
+            results.append(data)
+
+            if i < len(hotel_codes) - 1:
                 print(f"    等待 {delay} 秒...")
                 time.sleep(delay)
 
         return results
 
 
-def parse_calendar_response(response_data: dict) -> List[dict]:
+def parse_cash_response(response_data: dict) -> List[dict]:
     """
-    解析日历 API 响应，提取每天最低价格
+    解析现金价格响应
 
-    实际响应路径: data -> hotels[] -> hotel + calendar[]
-    每天价格路径: calendar[].lowestRate.totalAmount
+    路径: data.hotels[].calendar[].lowestRate.totalAmount
+
+    返回: [{"hotel_code", "brand_code", "date", "cash_price", "cash_currency"}, ...]
+    """
+    results = []
+    if not response_data:
+        return results
+
+    data = response_data.get("data", {})
+    hotels = data.get("hotels", [])
+
+    for hotel_entry in hotels:
+        hotel_info = hotel_entry.get("hotel", {})
+        hotel_code = hotel_info.get("hotelMnemonic", "UNKNOWN")
+        brand_code = hotel_info.get("brandCode", "")
+        property_currency = hotel_info.get("propertyCurrency", "")
+
+        calendar = hotel_entry.get("calendar", [])
+
+        for day_data in calendar:
+            date = day_data.get("start", "")
+            lowest_rate = day_data.get("lowestRate")
+
+            cash_price = None
+            currency = property_currency
+
+            if lowest_rate:
+                try:
+                    cash_price = float(lowest_rate.get("totalAmount", 0))
+                except (ValueError, TypeError):
+                    cash_price = None
+                currency = lowest_rate.get("currency", property_currency)
+
+            results.append({
+                "hotel_code": hotel_code,
+                "brand_code": brand_code,
+                "date": date,
+                "cash_price": cash_price,
+                "cash_currency": currency,
+            })
+
+    return results
+
+
+def parse_points_response(response_data: dict) -> List[dict]:
+    """
+    解析积分价格响应
+
+    路径: data.hotels[].calendar[].offers[]
+    积分offer的特征: ratePlanCode 为 IVAN* 开头, isRewardNight=true
+    价格字段: offers[].totalPoints
+
+    返回: [{"hotel_code", "brand_code", "date", "points_price"}, ...]
+    """
+    results = []
+    if not response_data:
+        return results
+
+    data = response_data.get("data", {})
+    hotels = data.get("hotels", [])
+
+    # 构建 reward rate plan 集合 (从 ratePlans 中找 isRewardNight=true 的)
+    for hotel_entry in hotels:
+        hotel_info = hotel_entry.get("hotel", {})
+        hotel_code = hotel_info.get("hotelMnemonic", "UNKNOWN")
+        brand_code = hotel_info.get("brandCode", "")
+
+        # 找出积分 rate plan codes
+        rate_plans = hotel_entry.get("ratePlans", [])
+        reward_plan_codes = set()
+        for rp in rate_plans:
+            if rp.get("isRewardNight", False):
+                reward_plan_codes.add(rp["code"])
+
+        # 如果没有从 ratePlans 识别出来，使用默认的 IVAN* 前缀判断
+        calendar = hotel_entry.get("calendar", [])
+
+        for day_data in calendar:
+            date = day_data.get("start", "")
+            offers = day_data.get("offers", [])
+
+            # 找当天最低积分价格
+            lowest_points = None
+
+            for offer in offers:
+                rate_plan_code = offer.get("ratePlanCode", "")
+
+                # 判断是否是积分 offer
+                is_points_offer = (
+                    rate_plan_code in reward_plan_codes or
+                    rate_plan_code.startswith("IVAN")
+                )
+
+                if is_points_offer:
+                    total_points = offer.get("totalPoints")
+                    if total_points is not None:
+                        try:
+                            points_val = float(total_points)
+                            if lowest_points is None or points_val < lowest_points:
+                                lowest_points = points_val
+                        except (ValueError, TypeError):
+                            pass
+
+            results.append({
+                "hotel_code": hotel_code,
+                "brand_code": brand_code,
+                "date": date,
+                "points_price": lowest_points,
+            })
+
+    return results
+
+
+def merge_cash_and_points(cash_prices: List[dict], points_prices: List[dict]) -> List[dict]:
+    """
+    合并现金价格和积分价格到同一行
 
     返回:
     [
         {
             "hotel_code": "BKKHB",
             "brand_code": "IC",
-            "currency": "THB",
             "date": "2026-05-09",
-            "lowest_price": 6270.00,
-            "average_daily_price": 6270.00,
+            "cash_price": 6270.00,
+            "cash_currency": "THB",
+            "points_price": 44000.0,
         },
         ...
     ]
     """
-    parsed_results = []
+    cash_map = {}
+    for row in cash_prices:
+        key = (row["hotel_code"], row["date"])
+        cash_map[key] = row
 
-    if not response_data:
-        return parsed_results
+    points_map = {}
+    for row in points_prices:
+        key = (row["hotel_code"], row["date"])
+        points_map[key] = row
 
-    # 实际结构: { "data": { "hotels": [...] } }
-    data = response_data.get("data", {})
-    hotels = data.get("hotels", [])
+    all_keys = set(list(cash_map.keys()) + list(points_map.keys()))
+    merged = []
 
-    if not hotels:
-        print("[!] 响应中未找到 data.hotels")
-        print(f"    顶层键: {list(response_data.keys())}")
-        if "data" in response_data:
-            print(f"    data 层键: {list(response_data['data'].keys())}")
-        return parsed_results
+    for key in sorted(all_keys):
+        hotel_code, date = key
+        cash_row = cash_map.get(key, {})
+        points_row = points_map.get(key, {})
 
-    for hotel_entry in hotels:
-        # 酒店基本信息
-        hotel_info = hotel_entry.get("hotel", {})
-        hotel_code = hotel_info.get("hotelMnemonic", "UNKNOWN")
-        brand_code = hotel_info.get("brandCode", "")
-        property_currency = hotel_info.get("propertyCurrency", "")
+        merged.append({
+            "hotel_code": hotel_code,
+            "brand_code": cash_row.get("brand_code", points_row.get("brand_code", "")),
+            "date": date,
+            "cash_price": cash_row.get("cash_price"),
+            "cash_currency": cash_row.get("cash_currency", ""),
+            "points_price": points_row.get("points_price"),
+        })
 
-        # 日历数据
-        calendar = hotel_entry.get("calendar", [])
-
-        for day_data in calendar:
-            date = day_data.get("start", "")
-            lowest_rate = day_data.get("lowestRate", {})
-
-            if lowest_rate:
-                total_amount = lowest_rate.get("totalAmount")
-                avg_daily_amount = lowest_rate.get("averageDailyAmount")
-                currency = lowest_rate.get("currency", property_currency)
-
-                # 转为浮点数
-                try:
-                    total_amount = float(total_amount) if total_amount else None
-                except (ValueError, TypeError):
-                    total_amount = None
-
-                try:
-                    avg_daily_amount = float(avg_daily_amount) if avg_daily_amount else None
-                except (ValueError, TypeError):
-                    avg_daily_amount = None
-
-                parsed_results.append({
-                    "hotel_code": hotel_code,
-                    "brand_code": brand_code,
-                    "currency": currency,
-                    "date": date,
-                    "lowest_price": total_amount,
-                    "average_daily_price": avg_daily_amount,
-                })
-            else:
-                # 当天无可用房间
-                parsed_results.append({
-                    "hotel_code": hotel_code,
-                    "brand_code": brand_code,
-                    "currency": property_currency,
-                    "date": date,
-                    "lowest_price": None,
-                    "average_daily_price": None,
-                })
-
-    return parsed_results
+    return merged
 
 
 def export_to_csv(data: List[dict], filename: str = "ihg_prices.csv"):
@@ -295,7 +397,7 @@ def export_to_csv(data: List[dict], filename: str = "ihg_prices.csv"):
         print("[-] 没有数据可导出")
         return
 
-    fieldnames = ["hotel_code", "brand_code", "currency", "date", "lowest_price", "average_daily_price"]
+    fieldnames = ["hotel_code", "brand_code", "date", "cash_price", "cash_currency", "points_price"]
 
     with open(filename, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -313,7 +415,7 @@ def export_to_json(data: List[dict], filename: str = "ihg_prices.json"):
     print(f"[+] 数据已导出到: {filename}")
 
 
-def save_raw_response(response_data: dict, filename: str = "ihg_raw_response.json"):
+def save_raw_response(response_data: dict, filename: str):
     """保存原始 API 响应（用于调试）"""
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(response_data, f, indent=2, ensure_ascii=False)
@@ -324,7 +426,7 @@ def main():
     """主函数"""
     print("=" * 60)
     print("IHG Hotel Calendar Price Fetcher")
-    print("获取每天最低现金价格")
+    print("获取每天最低现金价格 + 积分价格")
     print("=" * 60)
 
     if not COOKIES:
@@ -337,12 +439,11 @@ def main():
         print("    4. 复制请求头中的 Cookie 值")
         print()
 
-    # 初始化获取器
     fetcher = IHGCalendarFetcher(api_key=API_KEY, cookies=COOKIES)
 
-    # 获取数据
     print(f"\n[*] 开始获取 {len(HOTEL_CODES)} 个酒店的日历价格...")
     print(f"    日期范围: {START_DATE} ~ {END_DATE}")
+    print(f"    每个酒店获取: 现金价格 + 积分价格")
     print()
 
     results = fetcher.fetch_multiple_hotels(
@@ -351,7 +452,6 @@ def main():
         end_date=END_DATE,
         length_of_stay=LENGTH_OF_STAY,
         adults=ADULTS,
-        batch_size=1,
         delay=REQUEST_DELAY,
     )
 
@@ -361,29 +461,40 @@ def main():
 
     # 保存原始响应
     for i, result in enumerate(results):
-        save_raw_response(result, f"ihg_raw_response_{i}.json")
+        if result["cash"]:
+            save_raw_response(result["cash"], f"ihg_raw_cash_{i}.json")
+        if result["points"]:
+            save_raw_response(result["points"], f"ihg_raw_points_{i}.json")
 
     # 解析数据
     print("\n[*] 解析价格数据...")
-    all_prices = []
+    all_cash_prices = []
+    all_points_prices = []
+
     for result in results:
-        prices = parse_calendar_response(result)
-        all_prices.extend(prices)
+        if result["cash"]:
+            all_cash_prices.extend(parse_cash_response(result["cash"]))
+        if result["points"]:
+            all_points_prices.extend(parse_points_response(result["points"]))
+
+    # 合并
+    merged_prices = merge_cash_and_points(all_cash_prices, all_points_prices)
 
     # 打印预览
-    if all_prices:
+    if merged_prices:
         print(f"\n[*] 价格预览 (前10条):")
-        print(f"    {'酒店':<8} {'日期':<12} {'最低价':<12} {'货币'}")
-        print(f"    {'-'*8} {'-'*12} {'-'*12} {'-'*4}")
-        for row in all_prices[:10]:
-            price_str = f"{row['lowest_price']:.2f}" if row['lowest_price'] else "N/A"
-            print(f"    {row['hotel_code']:<8} {row['date']:<12} {price_str:<12} {row['currency']}")
+        print(f"    {'酒店':<8} {'日期':<12} {'现金价':<12} {'货币':<6} {'积分价'}")
+        print(f"    {'-'*8} {'-'*12} {'-'*12} {'-'*6} {'-'*10}")
+        for row in merged_prices[:10]:
+            cash_str = f"{row['cash_price']:.2f}" if row['cash_price'] else "N/A"
+            pts_str = f"{int(row['points_price'])}" if row['points_price'] else "N/A"
+            print(f"    {row['hotel_code']:<8} {row['date']:<12} {cash_str:<12} "
+                  f"{row['cash_currency']:<6} {pts_str}")
 
-        # 导出
-        export_to_csv(all_prices)
-        export_to_json(all_prices)
+        export_to_csv(merged_prices)
+        export_to_json(merged_prices)
     else:
-        print("\n[!] 解析结果为空，请检查 ihg_raw_response_*.json 文件")
+        print("\n[!] 解析结果为空，请检查原始响应文件")
 
     print("\n" + "=" * 60)
     print("完成!")
