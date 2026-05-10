@@ -1,12 +1,31 @@
 /**
  * IHG Calendar Price Fetcher - 浏览器控制台版本
- * 
+ * 获取每天最低现金价格
+ *
  * 使用方法:
  * 1. 在浏览器中打开 IHG 酒店页面 (如 ihg.com)
  * 2. 打开 DevTools (F12) -> Console
  * 3. 复制粘贴此脚本并运行
- * 
+ *
  * 优势: 直接利用浏览器已有的 Cookie 和会话，无需额外配置
+ *
+ * 实际 API 响应结构:
+ * {
+ *   "data": {
+ *     "hotels": [{
+ *       "hotel": { "brandCode": "IC", "hotelMnemonic": "BKKHB", "propertyCurrency": "THB" },
+ *       "calendar": [{
+ *         "start": "2026-05-09",
+ *         "end": "2026-05-09",
+ *         "lowestRate": {
+ *           "totalAmount": "6270.00",
+ *           "averageDailyAmount": "6270.00",
+ *           "currency": "THB"
+ *         }
+ *       }]
+ *     }]
+ *   }
+ * }
  */
 
 (async function IHGCalendarFetcher() {
@@ -17,21 +36,20 @@
         // 要查询的酒店代码列表
         hotelCodes: [
             "BKKHB",  // InterContinental Bangkok
-            "FAICW",  // 示例
-            // 添加更多...
+            // 添加更多酒店代码...
         ],
-        
+
         // 日期范围 (API 支持最多约2个月)
         startDate: "2026-05-10",
         endDate: "2026-07-10",
-        
+
         // 住宿配置
         lengthOfStay: 1,
         adults: 1,
-        
+
         // API Key
         apiKey: "se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y",
-        
+
         // 请求间隔(毫秒)
         delay: 2000,
     };
@@ -40,7 +58,7 @@
     const API_URL = "https://apis.ihg.com/availability/v1/calendar";
 
     function generateUUID() {
-        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
             const r = Math.random() * 16 | 0;
             const v = c === 'x' ? r : (r & 0x3 | 0x8);
             return v.toString(16);
@@ -84,7 +102,7 @@
                 method: "POST",
                 headers: headers,
                 body: JSON.stringify(payload),
-                credentials: "include",  // 携带 cookie
+                credentials: "include",
             });
 
             if (response.ok) {
@@ -103,75 +121,60 @@
 
     function parseCalendarData(result) {
         /**
-         * 解析日历响应，提取每日价格
-         * 注意: 需要根据实际响应结构调整此函数
+         * 解析响应，提取每天最低价格
+         * 路径: data.hotels[].calendar[].lowestRate.totalAmount
          */
         const prices = [];
         const { hotelCode, data } = result;
 
-        if (!data) return prices;
+        if (!data || !data.data) {
+            console.warn(`⚠️ ${hotelCode}: 响应中无 data 字段`);
+            return prices;
+        }
 
-        // 先打印响应结构的顶层键，方便调试
-        console.log(`📋 ${hotelCode} 响应顶层键:`, Object.keys(data));
+        const hotels = data.data.hotels || [];
 
-        // 尝试解析 - 以下是几种可能的响应结构
-        // 结构1: { hotelCalendars: [{ hotelMnemonic, calendar: [...] }] }
-        const hotelCalendars = data.hotelCalendars || data.calendars || data.data || [];
-        
-        if (Array.isArray(hotelCalendars)) {
-            for (const hotelCal of hotelCalendars) {
-                const code = hotelCal.hotelMnemonic || hotelCal.hotelCode || hotelCode;
-                const days = hotelCal.calendar || hotelCal.dates || hotelCal.days || [];
-                
-                for (const day of days) {
+        for (const hotelEntry of hotels) {
+            const hotelInfo = hotelEntry.hotel || {};
+            const code = hotelInfo.hotelMnemonic || hotelCode;
+            const brandCode = hotelInfo.brandCode || "";
+            const propertyCurrency = hotelInfo.propertyCurrency || "";
+
+            const calendar = hotelEntry.calendar || [];
+
+            for (const day of calendar) {
+                const date = day.start || "";
+                const lowestRate = day.lowestRate || null;
+
+                if (lowestRate) {
                     prices.push({
                         hotel_code: code,
-                        date: day.date || day.startDate,
-                        cash_price: extractCashPrice(day),
-                        points_price: extractPointsPrice(day),
-                        available: day.available !== false,
-                        raw: day,  // 保留原始数据供调试
+                        brand_code: brandCode,
+                        date: date,
+                        lowest_price: parseFloat(lowestRate.totalAmount) || null,
+                        average_daily_price: parseFloat(lowestRate.averageDailyAmount) || null,
+                        currency: lowestRate.currency || propertyCurrency,
+                    });
+                } else {
+                    // 当天无可用房间
+                    prices.push({
+                        hotel_code: code,
+                        brand_code: brandCode,
+                        date: date,
+                        lowest_price: null,
+                        average_daily_price: null,
+                        currency: propertyCurrency,
                     });
                 }
             }
         }
 
-        // 如果上面没解析出来，保存原始数据
         if (prices.length === 0) {
-            console.warn(`⚠️ ${hotelCode}: 无法自动解析，请查看原始数据`);
-            console.log("原始响应:", JSON.stringify(data, null, 2).substring(0, 3000));
+            console.warn(`⚠️ ${hotelCode}: 未解析出价格数据`);
+            console.log("原始响应键:", Object.keys(data));
         }
 
         return prices;
-    }
-
-    function extractCashPrice(dayData) {
-        // 尝试各种可能的现金价格字段
-        if (dayData.lowestOffer) {
-            return dayData.lowestOffer.amount || dayData.lowestOffer.price;
-        }
-        if (dayData.lowest) {
-            return dayData.lowest.amount || dayData.lowest.price;
-        }
-        if (dayData.amounts) {
-            return dayData.amounts.afterTax || dayData.amounts.beforeTax;
-        }
-        if (dayData.cashPrice !== undefined) return dayData.cashPrice;
-        if (dayData.price !== undefined) return dayData.price;
-        return null;
-    }
-
-    function extractPointsPrice(dayData) {
-        // 尝试各种可能的积分价格字段
-        if (dayData.pointsOffer) {
-            return dayData.pointsOffer.points || dayData.pointsOffer.amount;
-        }
-        if (dayData.lowestPointsOffer) {
-            return dayData.lowestPointsOffer.points || dayData.lowestPointsOffer.amount;
-        }
-        if (dayData.points !== undefined) return dayData.points;
-        if (dayData.pointsPrice !== undefined) return dayData.pointsPrice;
-        return null;
     }
 
     function exportToCSV(allPrices) {
@@ -180,16 +183,17 @@
             return;
         }
 
-        const headers = ["hotel_code", "date", "cash_price", "points_price", "available"];
+        const headers = ["hotel_code", "brand_code", "date", "lowest_price", "average_daily_price", "currency"];
         const csvLines = [headers.join(",")];
 
         for (const row of allPrices) {
             csvLines.push([
                 row.hotel_code,
+                row.brand_code,
                 row.date,
-                row.cash_price || "",
-                row.points_price || "",
-                row.available,
+                row.lowest_price !== null ? row.lowest_price : "",
+                row.average_daily_price !== null ? row.average_daily_price : "",
+                row.currency,
             ].join(","));
         }
 
@@ -217,11 +221,11 @@
     }
 
     // ============ 主流程 ============
-    console.log("🏨 IHG Calendar Price Fetcher");
-    console.log("================================");
+    console.log("🏨 IHG Calendar Price Fetcher - 每日最低价格");
+    console.log("================================================");
     console.log(`酒店数量: ${CONFIG.hotelCodes.length}`);
     console.log(`日期范围: ${CONFIG.startDate} ~ ${CONFIG.endDate}`);
-    console.log("================================\n");
+    console.log("================================================\n");
 
     const allResults = [];
     const allPrices = [];
@@ -238,28 +242,37 @@
             allPrices.push(...prices);
         }
 
-        // 间隔
         if (i < CONFIG.hotelCodes.length - 1) {
             await sleep(CONFIG.delay);
         }
     }
 
     // 输出汇总
-    console.log("\n================================");
-    console.log(`📊 汇总: 共获取 ${allResults.filter(r => r.success).length}/${CONFIG.hotelCodes.length} 个酒店`);
-    console.log(`📊 解析出 ${allPrices.length} 条日价格记录`);
+    console.log("\n================================================");
+    console.log(`📊 汇总: 成功 ${allResults.filter(r => r.success).length}/${CONFIG.hotelCodes.length} 个酒店`);
+    console.log(`📊 共 ${allPrices.length} 条每日价格记录`);
 
-    // 导出数据
+    // 打印表格预览
     if (allPrices.length > 0) {
+        console.log("\n📋 价格预览 (前15条):");
+        console.table(allPrices.slice(0, 15).map(p => ({
+            酒店: p.hotel_code,
+            日期: p.date,
+            最低价: p.lowest_price,
+            货币: p.currency,
+        })));
+
+        // 导出
         exportToCSV(allPrices);
     }
+
     exportToJSON(allResults);
 
-    // 存储到全局变量方便后续分析
+    // 全局变量
     window.__IHG_RESULTS = allResults;
     window.__IHG_PRICES = allPrices;
-    console.log("\n💡 数据已存储到 window.__IHG_RESULTS 和 window.__IHG_PRICES");
-    console.log("   可以在控制台中查看: console.table(window.__IHG_PRICES)");
+    console.log("\n💡 数据已存储到 window.__IHG_PRICES");
+    console.log("   查看全部: console.table(window.__IHG_PRICES)");
 
     return { results: allResults, prices: allPrices };
 })();
