@@ -99,63 +99,157 @@ SEED_URL_TEMPLATE = (
 
 # ============ 汇率模块 ============
 
+# IHG 内部汇率 API (与网站显示的价格完全一致)
+IHG_FX_API = "https://apis.ihg.com/finance/conversions/v2/currencies"
+
+# 常见的 IHG 酒店使用的货币列表 (用于批量预取汇率)
+COMMON_CURRENCIES = [
+    "USD", "EUR", "GBP", "JPY", "THB", "CNY", "AUD", "CAD", "SGD", "HKD",
+    "KRW", "INR", "AED", "SAR", "MYR", "IDR", "PHP", "TWD", "VND", "NZD",
+    "CHF", "SEK", "NOK", "DKK", "MXN", "BRL", "ZAR", "EGP", "QAR", "BHD",
+    "OMR", "KWD", "JOD", "TRY", "RUB", "PLN", "CZK", "HUF", "RON", "BGN",
+]
+
+
 class FxRates:
     """
     汇率缓存器
-    - 启动时一次性拉取当天的汇率 (base=CNY), 后续所有换算从缓存取
-    - 使用 Frankfurter API (免费无 key)
+    - 优先使用 IHG 自己的汇率 API (与网站一致)
+    - 回退到 Frankfurter API (免费)
     """
 
     def __init__(self, target: str = "CNY"):
         self.target = target.upper()
         self.rates: Dict[str, float] = {self.target: 1.0}
-        self.last_updated: Optional[str] = None
+        self.source: str = ""
 
     def load(self) -> bool:
+        """加载汇率, 优先 IHG API, 回退 Frankfurter"""
+        if self._load_ihg():
+            return True
+        print("[*] IHG 汇率 API 不可用, 回退到 Frankfurter...")
+        return self._load_frankfurter()
+
+    def _load_ihg(self) -> bool:
         """
-        从 Frankfurter 拉取所有币种对 CNY 的汇率
-        返回是否成功
+        使用 IHG 内部汇率 API:
+        GET https://apis.ihg.com/finance/conversions/v2/currencies?qFcc=USD&qTcc=CNY&qV=1
+        返回 1 USD = ? CNY
         """
+        loaded = 0
+        for cur in COMMON_CURRENCIES:
+            if cur.upper() == self.target:
+                continue
+            try:
+                resp = requests.get(
+                    IHG_FX_API,
+                    params={"qFcc": cur, "qTcc": self.target, "qV": "1"},
+                    headers={
+                        "x-ihg-api-key": API_KEY,
+                        "accept": "application/json",
+                    },
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # 响应通常包含换算后的金额
+                    # 可能结构: {"convertedAmount": 7.28, ...} 或 {"data": {"convertedValue": 7.28}}
+                    rate = self._extract_rate_from_ihg_response(data)
+                    if rate and rate > 0:
+                        self.rates[cur.upper()] = rate
+                        loaded += 1
+            except Exception:
+                pass
+
+        if loaded > 0:
+            self.source = "IHG Finance API"
+            print(f"[+] IHG 汇率加载成功, 共 {loaded} 个币种 → {self.target}")
+            return True
+        return False
+
+    @staticmethod
+    def _extract_rate_from_ihg_response(data: dict) -> Optional[float]:
+        """
+        从 IHG 汇率 API 响应中提取换算率
+        可能的结构:
+        - {"convertedAmount": 7.28}
+        - {"data": {"convertedValue": 7.28}}
+        - {"result": 7.28}
+        - 直接数字
+        """
+        if not data:
+            return None
+
+        # 尝试多种可能的字段
+        for key in ["convertedAmount", "convertedValue", "result", "value", "amount"]:
+            if key in data:
+                try:
+                    return float(data[key])
+                except (ValueError, TypeError):
+                    pass
+
+        # 嵌套在 data 里
+        inner = data.get("data", {})
+        if isinstance(inner, dict):
+            for key in ["convertedAmount", "convertedValue", "result", "value", "amount"]:
+                if key in inner:
+                    try:
+                        return float(inner[key])
+                    except (ValueError, TypeError):
+                        pass
+
+        # 如果整个响应只有一个数字字段
+        for v in data.values():
+            if isinstance(v, (int, float)) and v > 0:
+                return float(v)
+
+        return None
+
+    def _load_frankfurter(self) -> bool:
+        """回退: 从 Frankfurter 拉取汇率"""
         try:
-            # Frankfurter API: 获取以 CNY 为 base 的所有汇率
             resp = requests.get(
                 "https://api.frankfurter.dev/v1/latest",
                 params={"base": self.target},
                 timeout=10,
             )
             if resp.status_code != 200:
-                print(f"[!] 汇率 API 返回 {resp.status_code}")
+                print(f"[!] Frankfurter API 返回 {resp.status_code}")
                 return False
 
             data = resp.json()
-            # data.rates 形如 {"USD": 0.138, "THB": 4.52, ...}
-            # 表示 1 CNY = 0.138 USD = 4.52 THB
-            # 我们要反过来: 1 USD = 1/0.138 CNY
             src_rates = data.get("rates", {})
-            self.last_updated = data.get("date", "")
 
             for currency, rate_to_cny_base in src_rates.items():
                 if rate_to_cny_base and rate_to_cny_base > 0:
-                    # 1 <currency> = (1 / rate_to_cny_base) CNY
                     self.rates[currency.upper()] = 1.0 / rate_to_cny_base
 
-            # Frankfurter 可能不包含 CNY (base 自己), 手动补
             self.rates[self.target] = 1.0
-
-            print(f"[+] 汇率加载成功 (日期: {self.last_updated}), 共 {len(self.rates)} 个币种")
+            self.source = f"Frankfurter ({data.get('date', '')})"
+            print(f"[+] Frankfurter 汇率加载成功, 共 {len(self.rates)} 个币种")
             return True
         except Exception as e:
-            print(f"[!] 汇率加载失败: {e}")
+            print(f"[!] Frankfurter 汇率也加载失败: {e}")
             return False
+
+    def load_single_via_ihg_browser(self, page, from_currency: str) -> Optional[float]:
+        """
+        在浏览器上下文里调 IHG 汇率 API (自动带 cookie, 绕过 Akamai)
+        用于运行时碰到新币种时动态补充
+        """
+        # 这个方法由 async 主循环调用, 这里只是占位
+        # 实际调用在 fetch_fx_via_browser
+        pass
 
     def to_target(self, amount: Optional[float], currency: str) -> Optional[float]:
         """把 amount (以 currency 计价) 换算为目标货币"""
         if amount is None or not currency:
             return None
         currency = currency.upper()
+        if currency == self.target:
+            return round(amount, 2)
         rate = self.rates.get(currency)
         if rate is None:
-            # 找不到的话尝试几个近似
             fallback_map = {"RMB": "CNY", "YUAN": "CNY"}
             rate = self.rates.get(fallback_map.get(currency, ""))
         if rate is None:
@@ -164,6 +258,72 @@ class FxRates:
 
 
 # ============ Playwright 抓取 ============
+
+
+async def fetch_fx_via_browser(page: Page, from_currency: str, to_currency: str = "CNY") -> Optional[float]:
+    """
+    在浏览器上下文中调用 IHG 汇率 API
+    GET https://apis.ihg.com/finance/conversions/v2/currencies?qFcc=USD&qTcc=CNY&qV=1
+    这样可以绕过 Akamai, 同时使用 IHG 官方汇率
+    """
+    js_code = """
+    async ({ fromCur, toCur, apiKey }) => {
+        try {
+            const url = `https://apis.ihg.com/finance/conversions/v2/currencies?qFcc=${fromCur}&qTcc=${toCur}&qV=1`;
+            const resp = await fetch(url, {
+                method: "GET",
+                headers: {
+                    "accept": "application/json",
+                    "x-ihg-api-key": apiKey,
+                },
+                credentials: "include",
+            });
+            if (!resp.ok) return { ok: false, status: resp.status };
+            const data = await resp.json();
+            return { ok: true, data: data };
+        } catch (err) {
+            return { ok: false, error: err.message };
+        }
+    }
+    """
+    try:
+        result = await page.evaluate(js_code, {
+            "fromCur": from_currency.upper(),
+            "toCur": to_currency.upper(),
+            "apiKey": API_KEY,
+        })
+        if result.get("ok") and result.get("data"):
+            data = result["data"]
+            rate = FxRates._extract_rate_from_ihg_response(data)
+            if rate and rate > 0:
+                return rate
+    except Exception as e:
+        print(f"  [!] 浏览器汇率查询失败 ({from_currency}→{to_currency}): {e}")
+    return None
+
+
+async def load_fx_via_browser(page: Page, fx: FxRates) -> None:
+    """
+    在浏览器已建立 session 后, 通过 IHG 汇率 API 加载所有常用币种的汇率
+    这是最可靠的方式 (绕过 Akamai + 使用 IHG 官方汇率)
+    """
+    print(f"[*] 通过浏览器加载 IHG 汇率 ({fx.target})...")
+    loaded = 0
+    for cur in COMMON_CURRENCIES:
+        if cur.upper() == fx.target:
+            continue
+        if cur.upper() in fx.rates:
+            loaded += 1
+            continue  # 已有
+        rate = await fetch_fx_via_browser(page, cur, fx.target)
+        if rate:
+            fx.rates[cur.upper()] = rate
+            loaded += 1
+        await asyncio.sleep(0.3)  # 别太快
+
+    if loaded > 0:
+        fx.source = "IHG Finance API (via browser)"
+        print(f"[+] 浏览器汇率加载完成, 共 {loaded} 个币种 → {fx.target}")
 
 
 def build_seed_url(hotel_code: str) -> str:
@@ -541,6 +701,8 @@ async def run(
         page = await context.new_page()
 
         try:
+            fx_loaded_via_browser = False
+
             for hi, hotel_code in enumerate(hotel_codes):
                 hname = hotel_meta.get(hotel_code, {}).get("name", "")
                 print(f"\n{'=' * 50}")
@@ -552,6 +714,11 @@ async def run(
                     print(f"[-] 酒店 {hotel_code} 无法建立有效 session, 跳过")
                     continue
                 valid_sessions += 1
+
+                # 第一个成功建立 session 后, 通过浏览器加载 IHG 汇率
+                if not fx_loaded_via_browser:
+                    await load_fx_via_browser(page, fx)
+                    fx_loaded_via_browser = True
 
                 for wi, (ws, we) in enumerate(windows):
                     print(f"\n  --- 窗口 {wi + 1}/{len(windows)} ({ws} ~ {we}) ---")
