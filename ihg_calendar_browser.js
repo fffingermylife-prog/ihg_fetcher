@@ -39,8 +39,11 @@
 
         pointsRatePlanCodes: ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"],
 
-        // true=先尝试合并请求, 失败回退; false=直接双请求
-        tryCombinedRequest: true,
+        // 诊断已确认 IHG API 不支持合并请求:
+        //   - 不带 rates → 只返回现金价
+        //   - 带 rates → 只返回积分价
+        // 所以默认关闭, 直接双请求
+        tryCombinedRequest: false,
 
         delay: 2000,
     };

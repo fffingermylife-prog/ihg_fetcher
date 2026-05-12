@@ -69,8 +69,12 @@ POINTS_RATE_PLAN_CODES = ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"]
 
 # 是否先尝试合并请求 (一次请求同时获取现金+积分)
 # True: 先试合并, 若失败自动回退双请求
-# False: 直接用双请求(现金/积分分开)
-TRY_COMBINED_REQUEST = True
+# False: 直接用双请求 (现金/积分分开) ← 推荐, 诊断已确认 IHG 不支持合并
+# 注意: 诊断测试确认 IHG API 的行为:
+#   - 不带 rates → 只返回现金价, 不返回积分
+#   - 带 rates.ratePlanCodes → 只返回积分价, 不返回现金
+#   所以合并请求不可行, 默认关闭以节省一次浪费的验证请求
+TRY_COMBINED_REQUEST = False
 
 # ============ 配置结束 ============
 
