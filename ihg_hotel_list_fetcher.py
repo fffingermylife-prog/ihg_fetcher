@@ -44,9 +44,53 @@ from playwright.async_api import async_playwright, BrowserContext, Page
 
 # ============ 配置 ============
 
-# 入口
+# 入口 URL 列表 - 包含 /explore, 每个国家的 hotel-directory, 各品牌的 destinations
 START_URLS = [
     "https://www.ihg.com/explore",
+    # 各国 hotel-directory (IHG 各主要市场)
+    "https://www.ihg.com/hotels/us/en/hotel-directory",
+    "https://www.ihg.com/hotels/gb/en/hotel-directory",
+    "https://www.ihg.com/hotels/cn/en/hotel-directory",
+    "https://www.ihg.com/hotels/jp/en/hotel-directory",
+    "https://www.ihg.com/hotels/th/en/hotel-directory",
+    "https://www.ihg.com/hotels/au/en/hotel-directory",
+    "https://www.ihg.com/hotels/in/en/hotel-directory",
+    "https://www.ihg.com/hotels/de/en/hotel-directory",
+    "https://www.ihg.com/hotels/fr/en/hotel-directory",
+    "https://www.ihg.com/hotels/kr/en/hotel-directory",
+    "https://www.ihg.com/hotels/mx/en/hotel-directory",
+    "https://www.ihg.com/hotels/br/en/hotel-directory",
+    "https://www.ihg.com/hotels/ca/en/hotel-directory",
+    "https://www.ihg.com/hotels/ae/en/hotel-directory",
+    "https://www.ihg.com/hotels/eg/en/hotel-directory",
+    "https://www.ihg.com/hotels/za/en/hotel-directory",
+    "https://www.ihg.com/hotels/sg/en/hotel-directory",
+    "https://www.ihg.com/hotels/my/en/hotel-directory",
+    "https://www.ihg.com/hotels/id/en/hotel-directory",
+    "https://www.ihg.com/hotels/ph/en/hotel-directory",
+    "https://www.ihg.com/hotels/vn/en/hotel-directory",
+    "https://www.ihg.com/hotels/nz/en/hotel-directory",
+    "https://www.ihg.com/hotels/hk/en/hotel-directory",
+    "https://www.ihg.com/hotels/tw/en/hotel-directory",
+    "https://www.ihg.com/hotels/es/en/hotel-directory",
+    "https://www.ihg.com/hotels/it/en/hotel-directory",
+    "https://www.ihg.com/hotels/nl/en/hotel-directory",
+    "https://www.ihg.com/hotels/tr/en/hotel-directory",
+    "https://www.ihg.com/hotels/sa/en/hotel-directory",
+    "https://www.ihg.com/hotels/qa/en/hotel-directory",
+    # 各品牌的 destinations 入口
+    "https://www.ihg.com/intercontinental/destinations/us/en/explore",
+    "https://www.ihg.com/intercontinental/destinations/gb/en/explore",
+    "https://www.ihg.com/holidayinn/destinations/us/en/explore",
+    "https://www.ihg.com/holidayinnexpress/destinations/us/en/explore",
+    "https://www.ihg.com/crowneplaza/destinations/us/en/explore",
+    "https://www.ihg.com/hotelindigo/destinations/us/en/explore",
+    "https://www.ihg.com/kimptonhotels/destinations/us/en/explore",
+    "https://www.ihg.com/staybridge/destinations/us/en/explore",
+    "https://www.ihg.com/candlewood/destinations/us/en/explore",
+    "https://www.ihg.com/voco/destinations/us/en/explore",
+    "https://www.ihg.com/garner-hotels/destinations/us/en/explore",
+    "https://www.ihg.com/regent/destinations/us/en/explore",
 ]
 
 OUTPUT_CSV = "ihg_hotels.csv"
@@ -61,6 +105,12 @@ MAX_DEPTH = 5                    # BFS 最大深度
 PAGE_LOAD_TIMEOUT_MS = 30000
 DELAY_MS = 400                   # 每页间隔
 SCROLL_PASSES = 3                # 每页滚动次数 (触发懒加载)
+
+# 只要英文页面, 避免本地化重复 (ar, de, fr, es 等的主入口等同于 en)
+ENGLISH_ONLY = True
+
+# 连续 N 页没有新酒店时, 停止访问同一"分支"的类似页面
+DEAD_END_THRESHOLD = 10
 
 # ============ 配置结束 ============
 
@@ -123,8 +173,43 @@ def is_directory_url(url: str) -> bool:
     ]):
         return False
 
+    # ENGLISH_ONLY: 过滤非英文本地化 URL
+    # IHG URL 模式: /<lang>/explore 或 /hotels/<country>/<lang>/...
+    if ENGLISH_ONLY:
+        # /<2字母>/explore 形式 (如 /ar/explore, /de/explore, /fr/explore)
+        if re.match(r'^https?://[^/]+/[a-z]{2}/explore(/|$)', url_lower):
+            # 只允许 /en/explore 或没有语言前缀的 /explore
+            if not re.match(r'^https?://[^/]+/en/explore', url_lower):
+                return False
+        # /hotels/<country>/<lang>/... 形式, 只允许 lang=en
+        m = re.match(r'^https?://[^/]+/(?:[a-z-]+/)?hotels/[a-z]{2}/([a-z]{2})/', url_lower)
+        if m and m.group(1) != "en":
+            return False
+        # /<brand>/destinations/<country>/<lang>/... 形式, 只允许 lang=en
+        m = re.match(r'^https?://[^/]+/[a-z-]+/destinations/[a-z]{2}/([a-z]{2})/', url_lower)
+        if m and m.group(1) != "en":
+            return False
+        # /<brand>/content/<country>/<lang>/... 形式, 只允许 lang=en
+        m = re.match(r'^https?://[^/]+/[a-z-]+/content/[a-z]{2}/([a-z]{2})/', url_lower)
+        if m and m.group(1) != "en":
+            return False
+
+    # 排除营销页, 但允许各品牌的 /explore-hotels 目录
+    if "/explore/" in url_lower and "/explore-hotels" not in url_lower:
+        # /explore/<region> 是营销页, 内容重复不含酒店链接
+        # 只保留 /explore 本身作为入口
+        marketing_patterns = [
+            "/explore/europe", "/explore/asia", "/explore/americas",
+            "/explore/middle-east", "/explore/africa", "/explore/oceania",
+            "/explore/caribbean", "/explore/new-hotels", "/explore/us",
+            "/explore/uk", "/explore/all-inclusive",
+        ]
+        for mp in marketing_patterns:
+            if mp in url_lower:
+                return False
+
     patterns = [
-        r"/explore(/|$)",
+        r"/explore(/|$|\?)",
         r"/destinations(/|$)",
         r"/destination(/|$)",
         r"/hotel-directory",
