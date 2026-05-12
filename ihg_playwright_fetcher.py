@@ -7,42 +7,55 @@ IHG Calendar Price Fetcher - Playwright 永久自动化版本
 - 持久化 session (launch_persistent_context), 重复运行更快
 - 完全无人值守, 适合 cron 定时任务
 
+新增功能:
+- 支持从 ihg_hotels.csv 读取酒店列表 (由 ihg_hotel_list_fetcher.py 生成)
+- 汇率换算: 把各种本地货币 (THB/USD/...) 换算成人民币 (CNY)
+- 输出包含本地价 + CNY 价 + CPP(CNY 口径)
+
 依赖安装:
-    pip install playwright
+    pip install playwright requests
     playwright install chromium
 
 使用:
+    # 方式 A: 用脚本内配置的 HOTEL_CODES
     python ihg_playwright_fetcher.py
 
+    # 方式 B: 从 CSV 读取酒店列表
+    python ihg_playwright_fetcher.py --hotels-csv ihg_hotels.csv
+    python ihg_playwright_fetcher.py --hotels-csv ihg_hotels.csv --country cn
+    python ihg_playwright_fetcher.py --hotels-csv ihg_hotels.csv --brand IC --limit 5
+
+    # 方式 C: 只看指定的几个酒店
+    python ihg_playwright_fetcher.py --codes BKKHB,NYCHA
+
 定时任务 (crontab -e):
-    0 3 * * *  cd /path/to/script && /usr/bin/python3 ihg_playwright_fetcher.py >> ihg.log 2>&1
+    0 3 * * *  cd /path/to/script && /usr/bin/python3 ihg_playwright_fetcher.py --hotels-csv ihg_hotels.csv >> ihg.log 2>&1
 """
 
+import argparse
 import asyncio
 import csv
 import json
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import requests
 from playwright.async_api import async_playwright, BrowserContext, Page
 
 
 # ============ 配置区域 ============
 
-# 要查询的酒店代码列表
+# 默认酒店代码 (当没指定 --hotels-csv 或 --codes 时使用)
 HOTEL_CODES = [
     "BKKHB",   # InterContinental Bangkok
-    # "SFOHA",
-    # "NYCHA",
-    # 添加更多...
 ]
 
 # 滑动窗口配置
-DAYS_AHEAD = 365            # 获取从明天起未来多少天
-WINDOW_SIZE_DAYS = 60       # 每次请求的日期窗口大小 (IHG 上限 ~60 天)
+DAYS_AHEAD = 365
+WINDOW_SIZE_DAYS = 60
 
 # 住宿
 LENGTH_OF_STAY = 1
@@ -54,20 +67,25 @@ API_KEY = "se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y"
 # 积分 Rate Plan Codes
 POINTS_RATE_PLAN_CODES = ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"]
 
-# 请求间隔 (毫秒), 避免被限流
+# 请求间隔 (毫秒)
 REQUEST_DELAY_MS = 2000
 
 # 浏览器设置
-HEADLESS = True                     # True=后台静默, False=显示浏览器 (首次调试建议改 False)
-USER_DATA_DIR = "./ihg_browser_profile"   # 持久化 session 目录 (cookie/localStorage 保存在这)
+HEADLESS = True
+USER_DATA_DIR = "./ihg_browser_profile"
 
 # 输出文件
 OUTPUT_CSV = "ihg_prices.csv"
 OUTPUT_JSON = "ihg_prices.json"
 OUTPUT_RAW = "ihg_raw_snapshots.json"
 
-# 种子 URL: 访问这个页面来建立 session
-# 必须是 select-roomrate 格式的 URL, 否则 API 请求会返回 50027
+# 汇率: 目标货币
+TARGET_CURRENCY = "CNY"
+
+# 积分价值估算 (CNY): 用于在没有同日现金价时做 CPP 估算
+# 按 IHG Points 业内公认价值 ~0.5 美分/点 = ~0.036 CNY/点, 这里不使用, 而是严格用实际现金价
+
+# 种子 URL 模板
 SEED_URL_TEMPLATE = (
     "https://www.ihg.com/intercontinental/hotels/us/en/find-hotels/select-roomrate"
     "?fromRedirect=true&qSrt=sBR&qSlH={hotel_code}&qRms=1&qAdlt=1&qChld=0"
@@ -79,8 +97,77 @@ SEED_URL_TEMPLATE = (
 # ============ 配置结束 ============
 
 
+# ============ 汇率模块 ============
+
+class FxRates:
+    """
+    汇率缓存器
+    - 启动时一次性拉取当天的汇率 (base=CNY), 后续所有换算从缓存取
+    - 使用 Frankfurter API (免费无 key)
+    """
+
+    def __init__(self, target: str = "CNY"):
+        self.target = target.upper()
+        self.rates: Dict[str, float] = {self.target: 1.0}
+        self.last_updated: Optional[str] = None
+
+    def load(self) -> bool:
+        """
+        从 Frankfurter 拉取所有币种对 CNY 的汇率
+        返回是否成功
+        """
+        try:
+            # Frankfurter API: 获取以 CNY 为 base 的所有汇率
+            resp = requests.get(
+                "https://api.frankfurter.dev/v1/latest",
+                params={"base": self.target},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                print(f"[!] 汇率 API 返回 {resp.status_code}")
+                return False
+
+            data = resp.json()
+            # data.rates 形如 {"USD": 0.138, "THB": 4.52, ...}
+            # 表示 1 CNY = 0.138 USD = 4.52 THB
+            # 我们要反过来: 1 USD = 1/0.138 CNY
+            src_rates = data.get("rates", {})
+            self.last_updated = data.get("date", "")
+
+            for currency, rate_to_cny_base in src_rates.items():
+                if rate_to_cny_base and rate_to_cny_base > 0:
+                    # 1 <currency> = (1 / rate_to_cny_base) CNY
+                    self.rates[currency.upper()] = 1.0 / rate_to_cny_base
+
+            # Frankfurter 可能不包含 CNY (base 自己), 手动补
+            self.rates[self.target] = 1.0
+
+            print(f"[+] 汇率加载成功 (日期: {self.last_updated}), 共 {len(self.rates)} 个币种")
+            return True
+        except Exception as e:
+            print(f"[!] 汇率加载失败: {e}")
+            return False
+
+    def to_target(self, amount: Optional[float], currency: str) -> Optional[float]:
+        """把 amount (以 currency 计价) 换算为目标货币"""
+        if amount is None or not currency:
+            return None
+        currency = currency.upper()
+        rate = self.rates.get(currency)
+        if rate is None:
+            # 找不到的话尝试几个近似
+            fallback_map = {"RMB": "CNY", "YUAN": "CNY"}
+            rate = self.rates.get(fallback_map.get(currency, ""))
+        if rate is None:
+            return None
+        return round(amount * rate, 2)
+
+
+# ============ Playwright 抓取 ============
+
+
 def build_seed_url(hotel_code: str) -> str:
-    """为某个酒店构造 seed URL (用未来日期避免 50027 错误)"""
+    """为某个酒店构造 seed URL"""
     ci = date.today() + timedelta(days=30)
     co = ci + timedelta(days=1)
     return SEED_URL_TEMPLATE.format(
@@ -97,7 +184,6 @@ def iter_date_windows(
     windows = []
     current = start_date
     end_target = start_date + timedelta(days=total_days - 1)
-
     while current <= end_target:
         window_end = min(current + timedelta(days=window_size - 1), end_target)
         windows.append((current.isoformat(), window_end.isoformat()))
@@ -112,10 +198,7 @@ async def fetch_via_browser(
     end_date: str,
     points_mode: bool,
 ) -> Optional[dict]:
-    """
-    在浏览器页面上下文中执行 fetch API 调用
-    请求会自动携带浏览器里所有的 cookie, 完美绕过 Akamai 反爬
-    """
+    """在浏览器页面上下文中执行 fetch API 调用"""
     payload: Dict = {
         "hotelMnemonics": [hotel_code],
         "startDate": start_date,
@@ -136,8 +219,6 @@ async def fetch_via_browser(
     mode_str = "积分" if points_mode else "现金"
     tag = f"[{hotel_code} {start_date}~{end_date} {mode_str}]"
 
-    # 把 fetch 调用放在页面上下文里执行
-    # 这样浏览器自动带上所有 cookie (包括 Akamai 的 _abck, bm_sz 等)
     js_code = """
     async ({ apiKey, payload }) => {
         const uuid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
@@ -187,7 +268,7 @@ async def fetch_via_browser(
 
 
 def parse_cash_response(response_data: dict) -> List[dict]:
-    """解析现金价格: data.hotels[].calendar[].lowestRate.totalAmount"""
+    """解析现金价格"""
     results = []
     if not response_data:
         return results
@@ -220,7 +301,7 @@ def parse_cash_response(response_data: dict) -> List[dict]:
 
 
 def parse_points_response(response_data: dict) -> List[dict]:
-    """解析积分价格: data.hotels[].calendar[].offers[].totalPoints (IVAN* / isRewardNight)"""
+    """解析积分价格"""
     results = []
     if not response_data:
         return results
@@ -259,8 +340,18 @@ def parse_points_response(response_data: dict) -> List[dict]:
     return results
 
 
-def merge_prices(cash_prices: List[dict], points_prices: List[dict]) -> List[dict]:
-    """合并现金 + 积分到每日一行, 并计算 CPP (每积分价值)"""
+def merge_prices(
+    cash_prices: List[dict],
+    points_prices: List[dict],
+    fx: FxRates,
+    hotel_meta: Dict[str, dict],
+) -> List[dict]:
+    """
+    合并现金 + 积分到每日一行
+    - 用汇率换算成 CNY
+    - CPP 使用 CNY 口径 (每积分兑换价值 CNY × 100)
+    - 加入酒店元数据 (名称、国家、城市)
+    """
     cash_map = {(r["hotel_code"], r["date"]): r for r in cash_prices}
     pts_map = {(r["hotel_code"], r["date"]): r for r in points_prices}
 
@@ -272,20 +363,33 @@ def merge_prices(cash_prices: List[dict], points_prices: List[dict]) -> List[dic
         c = cash_map.get(key, {})
         p = pts_map.get(key, {})
         cash_price = c.get("cash_price")
+        cash_currency = c.get("cash_currency", "")
         points_price = p.get("points_price")
 
-        cpp = None
-        if cash_price and points_price and points_price > 0:
-            cpp = round(cash_price / points_price * 100, 4)
+        # 汇率换算
+        cash_price_cny = fx.to_target(cash_price, cash_currency) if cash_price else None
+
+        # CPP: 每 1000 点能换多少人民币 (越高越划算)
+        cpp_cny_per_1k = None
+        if cash_price_cny and points_price and points_price > 0:
+            cpp_cny_per_1k = round(cash_price_cny / points_price * 1000, 2)
+
+        # 酒店元数据
+        meta = hotel_meta.get(hotel_code, {})
 
         merged.append({
             "hotel_code": hotel_code,
-            "brand_code": c.get("brand_code") or p.get("brand_code") or "",
+            "hotel_name": meta.get("name", ""),
+            "brand_code": c.get("brand_code") or p.get("brand_code") or meta.get("brand_code", ""),
+            "brand_name": meta.get("brand_name", ""),
+            "country": meta.get("country", ""),
+            "city": meta.get("city", ""),
             "date": date_str,
             "cash_price": cash_price,
-            "cash_currency": c.get("cash_currency", ""),
+            "cash_currency": cash_currency,
+            "cash_price_cny": cash_price_cny,
             "points_price": points_price,
-            "cents_per_point": cpp,
+            "cpp_cny_per_1k_points": cpp_cny_per_1k,
         })
     return merged
 
@@ -294,11 +398,13 @@ def export_csv(data: List[dict], filename: str):
     if not data:
         return
     fieldnames = [
-        "hotel_code", "brand_code", "date",
-        "cash_price", "cash_currency", "points_price", "cents_per_point"
+        "hotel_code", "hotel_name", "brand_code", "brand_name",
+        "country", "city", "date",
+        "cash_price", "cash_currency", "cash_price_cny",
+        "points_price", "cpp_cny_per_1k_points"
     ]
     with open(filename, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
         w.writerows(data)
     print(f"[+] 已导出 CSV: {filename} ({len(data)} 条)")
@@ -310,24 +416,64 @@ def export_json(data, filename: str):
     print(f"[+] 已导出 JSON: {filename}")
 
 
+def load_hotels_from_csv(
+    csv_path: str,
+    country_filter: Optional[str] = None,
+    brand_filter: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> Tuple[List[str], Dict[str, dict]]:
+    """
+    从 CSV 读取酒店列表
+    返回: (酒店代码列表, 代码→元数据的映射)
+    """
+    if not Path(csv_path).exists():
+        print(f"[!] CSV 文件不存在: {csv_path}")
+        return [], {}
+
+    codes = []
+    meta = {}
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            mn = (row.get("mnemonic") or "").strip().upper()
+            if not mn:
+                continue
+
+            if country_filter and (row.get("country_code") or "").lower() != country_filter.lower():
+                continue
+            if brand_filter and (row.get("brand_code") or "").upper() != brand_filter.upper():
+                continue
+
+            codes.append(mn)
+            meta[mn] = {
+                "name": row.get("name", ""),
+                "brand_code": row.get("brand_code", ""),
+                "brand_name": row.get("brand_name", ""),
+                "country": row.get("country", ""),
+                "country_code": row.get("country_code", ""),
+                "city": row.get("city", ""),
+                "address": row.get("address", ""),
+            }
+
+            if limit and len(codes) >= limit:
+                break
+
+    print(f"[+] 从 {csv_path} 读取 {len(codes)} 个酒店")
+    return codes, meta
+
+
 async def wait_for_valid_session(page: Page, hotel_code: str, max_attempts: int = 3) -> bool:
-    """
-    访问种子页面建立合法 session
-    通过"预发一个 API 请求"检查 session 是否可用
-    """
+    """访问种子页面建立合法 session"""
     for attempt in range(max_attempts):
         seed_url = build_seed_url(hotel_code)
         print(f"[*] 访问种子页面建立 session (尝试 {attempt + 1}/{max_attempts})...")
-        print(f"    URL: {seed_url[:100]}...")
 
         try:
             await page.goto(seed_url, wait_until="domcontentloaded", timeout=60000)
-            # 等待一下, 让前端 JS 加载完成 + Akamai cookie 就位
             await page.wait_for_timeout(5000)
         except Exception as e:
             print(f"    [!] 页面加载异常: {e}")
 
-        # 预测试: 发一个小范围请求验证 session
         test_start = (date.today() + timedelta(days=1)).isoformat()
         test_end = (date.today() + timedelta(days=7)).isoformat()
         test_result = await fetch_via_browser(
@@ -344,30 +490,36 @@ async def wait_for_valid_session(page: Page, hotel_code: str, max_attempts: int 
     return False
 
 
-async def run():
+async def run(
+    hotel_codes: List[str],
+    hotel_meta: Dict[str, dict],
+    fx: FxRates,
+    output_csv: str = OUTPUT_CSV,
+    output_json: str = OUTPUT_JSON,
+    output_raw: str = OUTPUT_RAW,
+) -> int:
     print("=" * 60)
     print("IHG Playwright Fetcher - 永久自动化全量抓取")
     print("=" * 60)
 
-    # 滑动窗口日期
     start = date.today() + timedelta(days=1)
     windows = iter_date_windows(start, DAYS_AHEAD, WINDOW_SIZE_DAYS)
 
     print(f"\n配置:")
-    print(f"  酒店数: {len(HOTEL_CODES)}")
+    print(f"  酒店数: {len(hotel_codes)}")
     print(f"  日期: {start.isoformat()} 起 {DAYS_AHEAD} 天 → {len(windows)} 个窗口")
-    print(f"  预计请求数: {len(HOTEL_CODES) * len(windows) * 2} (现金+积分)")
+    print(f"  预计请求数: {len(hotel_codes) * len(windows) * 2} (现金+积分)")
+    print(f"  目标货币: {TARGET_CURRENCY}")
     print(f"  Headless: {HEADLESS}")
-    print(f"  Session 目录: {USER_DATA_DIR}")
 
     Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
 
     all_cash = []
     all_points = []
     raw_samples = []
+    valid_sessions = 0
 
     async with async_playwright() as p:
-        # 持久化 context: cookie/storage 保存在 USER_DATA_DIR, 下次运行复用
         context: BrowserContext = await p.chromium.launch_persistent_context(
             USER_DATA_DIR,
             headless=HEADLESS,
@@ -377,13 +529,9 @@ async def run():
             ),
             viewport={"width": 1280, "height": 800},
             locale="en-US",
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
         )
 
-        # 隐藏 webdriver 痕迹 (Akamai 会检测这个)
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
@@ -393,34 +541,31 @@ async def run():
         page = await context.new_page()
 
         try:
-            # 为每个酒店抓数据
-            for hi, hotel_code in enumerate(HOTEL_CODES):
+            for hi, hotel_code in enumerate(hotel_codes):
+                hname = hotel_meta.get(hotel_code, {}).get("name", "")
                 print(f"\n{'=' * 50}")
-                print(f"[酒店 {hi + 1}/{len(HOTEL_CODES)}] {hotel_code}")
+                print(f"[酒店 {hi + 1}/{len(hotel_codes)}] {hotel_code} {hname[:40]}")
                 print('=' * 50)
 
-                # 为该酒店建立 session (必要时重新导航)
                 ok = await wait_for_valid_session(page, hotel_code)
                 if not ok:
                     print(f"[-] 酒店 {hotel_code} 无法建立有效 session, 跳过")
                     continue
+                valid_sessions += 1
 
                 for wi, (ws, we) in enumerate(windows):
                     print(f"\n  --- 窗口 {wi + 1}/{len(windows)} ({ws} ~ {we}) ---")
 
-                    # 现金请求
                     cash_data = await fetch_via_browser(page, hotel_code, ws, we, points_mode=False)
                     if cash_data:
                         all_cash.extend(parse_cash_response(cash_data))
 
                     await page.wait_for_timeout(REQUEST_DELAY_MS)
 
-                    # 积分请求
                     pts_data = await fetch_via_browser(page, hotel_code, ws, we, points_mode=True)
                     if pts_data:
                         all_points.extend(parse_points_response(pts_data))
 
-                    # 保存第一个窗口的原始响应, 用于调试
                     if wi == 0:
                         if cash_data:
                             raw_samples.append({
@@ -433,44 +578,84 @@ async def run():
                                 "type": "points", "data": pts_data
                             })
 
-                    # 窗口间间隔
-                    is_last = (hi == len(HOTEL_CODES) - 1) and (wi == len(windows) - 1)
+                    is_last = (hi == len(hotel_codes) - 1) and (wi == len(windows) - 1)
                     if not is_last:
                         await page.wait_for_timeout(REQUEST_DELAY_MS)
 
         finally:
             await context.close()
 
-    # 合并 & 导出
-    merged = merge_prices(all_cash, all_points)
+    # 合并
+    merged = merge_prices(all_cash, all_points, fx, hotel_meta)
 
     print("\n" + "=" * 60)
-    print(f"完成! 共 {len(merged)} 条每日价格记录")
+    print(f"完成! 成功酒店: {valid_sessions}/{len(hotel_codes)}, 共 {len(merged)} 条每日价格")
     print("=" * 60)
 
     if merged:
         print(f"\n价格预览 (前 10 条):")
-        print(f"  {'酒店':<8} {'日期':<12} {'现金价':<10} {'货币':<6} {'积分价':<10} {'CPP'}")
-        print(f"  {'-'*8} {'-'*12} {'-'*10} {'-'*6} {'-'*10} {'-'*6}")
+        header = ["酒店", "日期", "现金(本地)", "币种", "现金(CNY)", "积分", "CPP(CNY/1k)"]
+        print("  " + " | ".join(f"{h:<10}" for h in header))
+        print("  " + "-" * 90)
         for row in merged[:10]:
             cash_str = f"{row['cash_price']:.2f}" if row['cash_price'] else "N/A"
+            cny_str = f"{row['cash_price_cny']:.2f}" if row['cash_price_cny'] else "N/A"
             pts_str = f"{int(row['points_price'])}" if row['points_price'] else "N/A"
-            cpp_str = f"{row['cents_per_point']}" if row['cents_per_point'] is not None else "N/A"
-            print(f"  {row['hotel_code']:<8} {row['date']:<12} {cash_str:<10} "
-                  f"{row['cash_currency']:<6} {pts_str:<10} {cpp_str}")
+            cpp_str = f"{row['cpp_cny_per_1k_points']}" if row['cpp_cny_per_1k_points'] else "N/A"
+            cells = [
+                row['hotel_code'][:10], row['date'][:10],
+                cash_str[:10], (row['cash_currency'] or '')[:10],
+                cny_str[:10], pts_str[:10], cpp_str[:10]
+            ]
+            print("  " + " | ".join(f"{c:<10}" for c in cells))
 
-        export_csv(merged, OUTPUT_CSV)
-        export_json(merged, OUTPUT_JSON)
+        export_csv(merged, output_csv)
+        export_json(merged, output_json)
 
     if raw_samples:
-        export_json(raw_samples, OUTPUT_RAW)
+        export_json(raw_samples, output_raw)
 
     return len(merged)
 
 
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser(description="IHG 价格全量抓取")
+    parser.add_argument("--hotels-csv", help="从 CSV 文件读取酒店列表 (由 ihg_hotel_list_fetcher.py 生成)")
+    parser.add_argument("--codes", help="直接指定酒店代码(逗号分隔), 如 BKKHB,NYCHA")
+    parser.add_argument("--country", help="过滤: 只抓指定国家代码 (如 cn, th)")
+    parser.add_argument("--brand", help="过滤: 只抓指定品牌 (如 IC)")
+    parser.add_argument("--limit", type=int, help="最多抓多少酒店")
+    parser.add_argument("--output", default=OUTPUT_CSV, help=f"输出CSV (默认 {OUTPUT_CSV})")
+    args = parser.parse_args()
+
+    # 1) 解析酒店列表
+    hotel_codes: List[str] = []
+    hotel_meta: Dict[str, dict] = {}
+
+    if args.codes:
+        hotel_codes = [c.strip().upper() for c in args.codes.split(",") if c.strip()]
+    elif args.hotels_csv:
+        hotel_codes, hotel_meta = load_hotels_from_csv(
+            args.hotels_csv,
+            country_filter=args.country,
+            brand_filter=args.brand,
+            limit=args.limit,
+        )
+    else:
+        hotel_codes = HOTEL_CODES[:]
+
+    if not hotel_codes:
+        print("[!] 没有酒店可抓, 请用 --hotels-csv 或 --codes 指定")
+        sys.exit(1)
+
+    # 2) 加载汇率
+    fx = FxRates(TARGET_CURRENCY)
+    if not fx.load():
+        print("[!] 汇率加载失败, 将只输出本地货币价格")
+
+    # 3) 运行
     try:
-        count = asyncio.run(run())
+        count = asyncio.run(run(hotel_codes, hotel_meta, fx, output_csv=args.output))
         sys.exit(0 if count > 0 else 1)
     except KeyboardInterrupt:
         print("\n用户中断")
@@ -480,3 +665,7 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
