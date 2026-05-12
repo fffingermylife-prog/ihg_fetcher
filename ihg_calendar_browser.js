@@ -28,8 +28,9 @@
         windowSizeDays: 60,        // 每次请求的日期窗口大小 (IHG 上限 ~60 天)
 
         // 固定范围 (slidingWindow=false 时使用)
-        startDate: "2026-05-10",
-        endDate: "2026-07-10",
+        // 注意: startDate 必须 >= 今天, 否则会报 50027 Invalid system range
+        startDate: "2026-06-01",
+        endDate: "2026-07-31",
 
         lengthOfStay: 1,
         adults: 1,
@@ -338,8 +339,11 @@
     // 构造窗口
     let windows;
     if (CONFIG.slidingWindow) {
-        windows = genWindows(new Date(), CONFIG.daysAhead, CONFIG.windowSizeDays);
-        console.log(`📅 滑动窗口模式: 未来 ${CONFIG.daysAhead} 天, 拆分为 ${windows.length} 个窗口`);
+        // 从明天开始,避免 "Invalid system range" (50027) 错误
+        const tomorrow = new Date();
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        windows = genWindows(tomorrow, CONFIG.daysAhead, CONFIG.windowSizeDays);
+        console.log(`📅 滑动窗口模式: 从 ${isoDate(tomorrow)} 起未来 ${CONFIG.daysAhead} 天, 拆分为 ${windows.length} 个窗口`);
     } else {
         windows = [[CONFIG.startDate, CONFIG.endDate]];
         console.log(`📅 固定范围: ${CONFIG.startDate} ~ ${CONFIG.endDate}`);

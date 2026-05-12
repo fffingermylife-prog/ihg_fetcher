@@ -83,11 +83,22 @@
         }
     }
 
-    // ==========  基础 payload (确认为已知有效) ==========
+    // ==========  日期: 使用从今天开始的动态日期,避免 startDate 过期 ==========
+    const today = new Date();
+    const addDays = (d, n) => {
+        const x = new Date(d);
+        x.setDate(x.getDate() + n);
+        return x.toISOString().slice(0, 10);
+    };
+    const START_DATE = addDays(today, 1);    // 明天开始
+    const END_DATE = addDays(today, 61);     // 60天窗口
+    const SHORT_END = addDays(today, 31);    // 30天窗口
+
+    // ==========  基础 payload ==========
     const BASE = {
         hotelMnemonics: ["BKKHB"],
-        startDate: "2026-05-10",
-        endDate: "2026-07-10",
+        startDate: START_DATE,
+        endDate: END_DATE,
         lengthOfStay: 1,
         guestCounts: [{ otaCode: "AQC10", count: 1 }],
         options: {
@@ -99,7 +110,9 @@
         }
     };
 
-    console.log("🔬 IHG API 诊断 v2 - 逐步定位 400 原因\n");
+    console.log("🔬 IHG API 诊断 v3 - 使用动态日期");
+    console.log(`   今天: ${today.toISOString().slice(0, 10)}`);
+    console.log(`   测试范围: ${START_DATE} ~ ${END_DATE}\n`);
 
     // 测试 1: 纯现金请求 (无 rates)
     const r1 = await tryRequest("1️⃣ 纯现金 (无 rates 字段)", { ...BASE });
@@ -122,7 +135,7 @@
     // 测试 4: 合并请求 - 缩短日期范围到 30 天
     const r4 = await tryRequest("4️⃣ 合并 (只 30 天, 看是否日期太长)", {
         ...BASE,
-        endDate: "2026-06-10",
+        endDate: SHORT_END,
         rates: { ratePlanCodes: ["IVANI"] }
     });
 

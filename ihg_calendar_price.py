@@ -46,8 +46,9 @@ HOTEL_CODES = [
 
 # ====== 查询范围模式 ======
 # 模式A: 固定日期范围 (SLIDING_WINDOW=False)
-START_DATE = "2026-05-10"
-END_DATE = "2026-07-10"
+# 注意: startDate 必须 >= 今天, 否则会报 50027 Invalid system range
+START_DATE = "2026-06-01"
+END_DATE = "2026-07-31"
 
 # 模式B: 滑动窗口获取 "日历开放的所有日期" (SLIDING_WINDOW=True)
 SLIDING_WINDOW = True         # True = 自动滑动窗口获取未来 N 天
@@ -450,7 +451,9 @@ def main():
 
     # ---- 计算所有查询窗口 ----
     if SLIDING_WINDOW:
-        start = date.today()
+        # 从明天开始,避免 "Invalid system range" (50027) 错误
+        # IHG API 不接受今天之前或今天的日期作为 startDate (部分时区)
+        start = date.today() + timedelta(days=1)
         windows = iter_date_windows(start, DAYS_AHEAD, WINDOW_SIZE_DAYS)
         print(f"\n[*] 滑动窗口模式")
         print(f"    总跨度: {DAYS_AHEAD} 天 (从 {start.isoformat()})")
