@@ -126,29 +126,60 @@ def extract_mnemonic_from_url(url: str) -> Optional[str]:
 
 
 def is_explore_url(url: str) -> bool:
-    """判断是否是 /explore 类目录 URL"""
+    """
+    判断是否是 "目录页" URL (需要进一步访问以获取酒店链接)
+    匹配:
+        /explore, /explore/<region>
+        /destinations/...
+        /<state-or-country>  如 /alabama-united-states, /thailand, /paris-france
+    """
     if not is_ihg_url(url):
         return False
     url_lower = url.lower()
 
-    # 排除非英文本地化
+    # 排除非英文本地化 (/ar/explore, /de/explore)
     if re.match(r'^https?://[^/]+/[a-z]{2}/explore(/|$)', url_lower):
         if not re.match(r'^https?://[^/]+/en/explore', url_lower):
             return False
 
+    # 排除明显无关 URL
     if any(x in url_lower for x in [
         "/reservation", "/checkout", "/account", "/signin",
         "/legal", ".pdf", ".jpg", "/customer-care",
+        "/rewards", "/about/", "/content/", "/offers",
     ]):
         return False
 
-    # 排除明显的营销文章
+    # 排除营销文章
     if any(x in url_lower for x in [
         "/explore/new-hotels", "/explore/all-inclusive",
     ]):
         return False
 
-    return "/explore" in url_lower or "/destinations" in url_lower
+    # 已知的目录路径
+    if "/explore" in url_lower or "/destinations" in url_lower:
+        return True
+
+    # 新发现的格式: https://www.ihg.com/<location-name>
+    # 如 /alabama-united-states, /thailand, /paris-france, /tokyo-japan
+    # 特征: ihg.com 根路径下的单段 slug, 包含连字符
+    try:
+        path = urlparse(url).path.strip('/')
+        # 单段路径 (不含额外的 /)
+        if '/' not in path and len(path) > 3 and len(path) < 80:
+            # 排除已知的非目录单段路径
+            non_directory_slugs = {
+                "explore", "hotels", "rewardsclub", "about", "careers",
+                "development", "llms.txt", "robots.txt", "sitemap.xml",
+            }
+            if path.lower() not in non_directory_slugs:
+                # 包含连字符的 slug 很可能是地理位置目录
+                if '-' in path:
+                    return True
+    except Exception:
+        pass
+
+    return False
 
 
 def extract_brand_from_url(url: str) -> str:
