@@ -242,31 +242,35 @@ async def click_all_regions(page: Page) -> int:
             except Exception:
                 continue
 
-    # 兜底: 点击所有 aria-expanded=false 的元素
-    if clicked < 3:
-        try:
-            num = await page.evaluate("""
-            async () => {
-                const wait = (ms) => new Promise(r => setTimeout(r, ms));
-                let count = 0;
-                const btns = [...document.querySelectorAll('[aria-expanded="false"]')];
-                for (const b of btns.slice(0, 40)) {
-                    try {
-                        b.scrollIntoView({behavior: 'instant', block: 'center'});
-                        b.click();
-                        count++;
-                        await wait(300);
-                    } catch(e) {}
-                }
-                await wait(1500);
-                return count;
+    # 精准兜底: 用已知的 class="cmp-accordion__button" 展开所有区域
+    # 这是从 ihg_page_structure.json 诊断中发现的精确选择器
+    try:
+        num = await page.evaluate("""
+        async () => {
+            const wait = (ms) => new Promise(r => setTimeout(r, ms));
+            let count = 0;
+            // 精确匹配 IHG /explore 页面的区域 accordion 按钮
+            const btns = [...document.querySelectorAll('button.cmp-accordion__button[aria-expanded="false"]')];
+            // 如果没匹配到, 回退到所有 aria-expanded=false
+            const targets = btns.length > 0 ? btns : [...document.querySelectorAll('[aria-expanded="false"]')];
+            for (const b of targets.slice(0, 50)) {
+                try {
+                    b.scrollIntoView({behavior: 'instant', block: 'center'});
+                    await wait(200);
+                    b.click();
+                    count++;
+                    await wait(800);  // 等待展开动画 + 内容加载
+                } catch(e) {}
             }
-            """)
-            if num > 0:
-                print(f"    ✓ 点击了 {num} 个 aria-expanded=false 元素")
-                clicked += num
-        except Exception:
-            pass
+            await wait(2000);
+            return count;
+        }
+        """)
+        if num > 0:
+            print(f"    ✓ [JS] 点击了 {num} 个 cmp-accordion__button 展开区域")
+            clicked += num
+    except Exception as e:
+        print(f"    [!] JS 点击失败: {e}")
 
     return clicked
 
@@ -415,9 +419,13 @@ async def crawl(debug=False, brand_filter=None, limit=None, do_bfs=True) -> List
             clicked = await click_all_regions(page)
             print(f"    共展开 {clicked} 个元素")
 
-            await page.wait_for_timeout(2500)
+            # 展开后需要额外等待 + 多次滚动, 让酒店链接完全渲染
+            await page.wait_for_timeout(3000)
+            for _ in range(5):
+                await page.evaluate("window.scrollBy(0, window.innerHeight)")
+                await page.wait_for_timeout(800)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(2000)
 
             stage1 = await extract_hotels(page)
             for h in stage1:
