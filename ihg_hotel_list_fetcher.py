@@ -223,19 +223,64 @@ async def main():
             except Exception:
                 pass
 
-            # === Step 2: 滚动到底部 ===
-            print("[Step 2] 滚动到底部加载内容...")
-            for _ in range(10):
+            # === Step 2: 滚动到底部 (和 ihg_test_single_region.py 完全一致) ===
+            print("[Step 2] 滚动到底部...")
+            for _ in range(8):
                 await page.evaluate("window.scrollBy(0, window.innerHeight)")
                 await page.wait_for_timeout(600)
             await page.wait_for_timeout(2000)
 
-            # === Step 3: 展开所有区域 ===
+            # 诊断: 检查 accordion 按钮是否已经存在
+            btn_count = await page.evaluate("""
+            () => {
+                const btns = [...document.querySelectorAll('button.cmp-accordion__button')];
+                return {
+                    count: btns.length,
+                    texts: btns.map(b => b.textContent.trim()).slice(0, 20)
+                };
+            }
+            """)
+            print(f"    检测到 {btn_count['count']} 个 accordion 按钮")
+            if btn_count['texts']:
+                print(f"    按钮文本: {btn_count['texts']}")
+
+            # 如果没找到 accordion 按钮, 可能需要更多滚动/等待
+            if btn_count['count'] == 0:
+                print("    [!] 未检测到 accordion 按钮, 尝试额外滚动...")
+                # 再次滚动到最底部并等待
+                for _ in range(5):
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(3000)
+                # 再检查一次
+                btn_count = await page.evaluate("""
+                () => {
+                    const btns = [...document.querySelectorAll('button.cmp-accordion__button')];
+                    return {
+                        count: btns.length,
+                        texts: btns.map(b => b.textContent.trim()).slice(0, 20)
+                    };
+                }
+                """)
+                print(f"    重试后检测到 {btn_count['count']} 个 accordion 按钮")
+                if btn_count['texts']:
+                    print(f"    按钮文本: {btn_count['texts']}")
+                if btn_count['count'] == 0:
+                    print("    [!] 仍然找不到 accordion 按钮!")
+                    print("    可能原因: 1) 页面被 Akamai 拦截 2) 页面结构变化 3) 需要有头模式")
+                    print("    建议: python ihg_hotel_list_fetcher.py --headless false")
+                    # 导出当前页面 HTML 片段帮助诊断
+                    html_snippet = await page.evaluate("""
+                    () => document.body.innerHTML.slice(0, 3000)
+                    """)
+                    print(f"    页面片段 (前3000字符): {html_snippet[:500]}...")
+
+            # === Step 3: 逐个展开所有区域 (严格复制测试脚本逻辑) ===
             print("[Step 3] 展开所有区域 accordion...")
             all_region_links = {}  # {region_name: [{href, text}, ...]}
 
             for region_name in REGION_NAMES:
-                # 点击展开该区域
+                # 点击展开该区域 (和 ihg_test_single_region.py 完全一致的 JS)
                 clicked = await page.evaluate("""
                 async (regionName) => {
                     const wait = (ms) => new Promise(r => setTimeout(r, ms));
@@ -257,7 +302,7 @@ async def main():
                     print(f"    [!] 未找到区域: {region_name}")
                     continue
 
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(2000)
 
                 # 从展开的面板中提取二级链接
                 region_links = await page.evaluate("""
