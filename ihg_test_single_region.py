@@ -163,11 +163,6 @@ async def main():
             region_name = "US & Canada"
             print(f"[Step 3] 只展开 '{region_name}'...")
 
-            # 先收集展开前的链接 (排除基线)
-            links_before = set()
-            for lk in await page.evaluate("""() => [...document.querySelectorAll('a[href]')].map(a => a.href)"""):
-                links_before.add(lk)
-
             # 点击展开
             clicked = await page.evaluate("""
             async (regionName) => {
@@ -188,24 +183,33 @@ async def main():
             print(f"    展开结果: {clicked}")
             await page.wait_for_timeout(2000)
 
-            # === Step 4: 收集该区域新出现的链接 ===
+            # === Step 4: 从展开的面板中直接提取链接 ===
             print(f"[Step 4] 收集 '{region_name}' 区域的二级链接...")
-            all_links_now = await page.evaluate("""
-            () => {
+            region_links = await page.evaluate("""
+            (regionName) => {
                 const arr = [];
-                for (const a of document.querySelectorAll('a.cmp-list__item-link')) {
-                    arr.push({href: a.href, text: (a.textContent || '').trim()});
+                // 找到该区域的按钮
+                const btns = [...document.querySelectorAll('button.cmp-accordion__button')];
+                const btn = btns.find(b => b.textContent.trim() === regionName);
+                if (!btn) return arr;
+                
+                // 按钮在 H3.cmp-accordion__header 里, 面板是 H3 的下一个兄弟 DIV
+                const header = btn.closest('.cmp-accordion__header') || btn.parentElement;
+                const panel = header?.nextElementSibling;
+                if (!panel) return arr;
+                
+                // 从面板中提取所有链接
+                const links = panel.querySelectorAll('a');
+                for (const a of links) {
+                    const href = a.href || '';
+                    const text = (a.textContent || '').trim();
+                    if (href && text) {
+                        arr.push({href, text});
+                    }
                 }
                 return arr;
             }
-            """)
-
-            # 只保留展开后新出现的 cmp-list__item-link 链接
-            region_links = []
-            for lk in all_links_now:
-                href = lk["href"]
-                if href not in links_before:
-                    region_links.append(lk)
+            """, region_name)
 
             print(f"    '{region_name}' 下有 {len(region_links)} 个二级链接")
             for lk in region_links[:5]:
