@@ -234,21 +234,43 @@ async def main():
                 print(f"\n[Step 5.{idx+1}] 访问: {link_text} ({url})")
                 print(f"    解析: 区域={region_name}, 州/省={state}, 国家={country}")
 
-                # 开启 GraphQL 拦截
-                intercepted_mnemonics.clear()
-                graphql_active = True
+                # 开启收集
+                graphql_active = False  # 暂不拦截 GraphQL
 
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(2000)
 
-                # 滚动
+                # 初始滚动
                 for _ in range(3):
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await page.wait_for_timeout(500)
 
-                # 点击 View More Hotels
+                # 循环: 提取酒店 → 滚动 → 点击 View More → 等待新卡片 → 重复直到数量不再增加
                 view_more_clicks = 0
-                for _ in range(50):
+                prev_count = 0
+                no_change_rounds = 0
+
+                while True:
+                    # 提取当前酒店数量
+                    current_count = await page.evaluate("""
+                    () => document.querySelectorAll('a[href*="/hoteldetail"]').length
+                    """)
+
+                    if current_count > prev_count:
+                        no_change_rounds = 0
+                        prev_count = current_count
+                    else:
+                        no_change_rounds += 1
+
+                    # 连续 2 轮没有新增, 停止
+                    if no_change_rounds >= 2:
+                        break
+
+                    # 滚动到底部
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(800)
+
+                    # 尝试点击 View More Hotels
                     clicked_vm = await page.evaluate("""
                     () => {
                         const els = [...document.querySelectorAll('button, a, [role="button"]')];
@@ -263,17 +285,21 @@ async def main():
                         return false;
                     }
                     """)
-                    if not clicked_vm:
+
+                    if clicked_vm:
+                        view_more_clicks += 1
+                        await page.wait_for_timeout(1500)  # 等新卡片加载
+                    else:
+                        # 没有按钮了, 再等一下确认
+                        await page.wait_for_timeout(1000)
                         break
-                    view_more_clicks += 1
-                    await page.wait_for_timeout(1500)
 
                 if view_more_clicks > 0:
-                    print(f"    点击了 {view_more_clicks} 次 View More")
+                    print(f"    点击了 {view_more_clicks} 次 View More, 最终 {prev_count} 个酒店卡片")
 
                 # 关闭拦截
                 graphql_active = False
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(500)
 
                 # 从 DOM 提取酒店链接
                 hotel_links = await page.evaluate("""
@@ -286,7 +312,7 @@ async def main():
                 }
                 """)
 
-                # 合并: DOM + GraphQL 拦截
+                # 提取酒店信息
                 page_hotels = {}
                 for hl in hotel_links:
                     mn = extract_mnemonic(hl["href"])
@@ -302,21 +328,7 @@ async def main():
                             "country": country,
                         }
 
-                # 补充 GraphQL 拦截到但 DOM 没有的
-                for mn in intercepted_mnemonics:
-                    if mn not in page_hotels:
-                        page_hotels[mn] = {
-                            "mnemonic": mn,
-                            "name": "",
-                            "url": "",
-                            "brand_code": "",
-                            "city": "",
-                            "region": region_name,
-                            "state": state,
-                            "country": country,
-                        }
-
-                print(f"    结果: DOM={len(hotel_links)} 链接, GraphQL={len(intercepted_mnemonics)} 代码, 合并={len(page_hotels)} 唯一酒店")
+                print(f"    结果: 共 {len(page_hotels)} 个唯一酒店")
                 all_hotels.extend(page_hotels.values())
 
             # === 最终输出 ===
