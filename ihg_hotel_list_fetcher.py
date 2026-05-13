@@ -515,6 +515,8 @@ def export_json(hotels: List[Dict], filename: str):
 
 
 def main():
+    global HEADLESS, MAX_PAGES
+
     parser = argparse.ArgumentParser(description="IHG 酒店列表抓取 (基于 /explore)")
     parser.add_argument("--brands", help="品牌过滤, 如 IC,HI")
     parser.add_argument("--limit", type=int, help="最多保留多少酒店")
@@ -525,7 +527,6 @@ def main():
     parser.add_argument("--debug", action="store_true", help="调试: 导出页面结构")
     args = parser.parse_args()
 
-    global HEADLESS, MAX_PAGES
     HEADLESS = (args.headless == "true")
     MAX_PAGES = args.max_pages
 
