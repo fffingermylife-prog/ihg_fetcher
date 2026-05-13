@@ -175,8 +175,8 @@ async def main():
     parser = argparse.ArgumentParser(description="IHG 酒店列表完整抓取")
     parser.add_argument("--region", type=str, default=None,
                         help='只抓指定地区, 支持链接文本 (如 "Alabama Hotels") 或 URL slug (如 "alabama-united-states")')
-    parser.add_argument("--headless", default="true", choices=["true", "false"],
-                        help="是否无头模式 (默认 true)")
+    parser.add_argument("--headless", default="false", choices=["true", "false"],
+                        help="是否无头模式 (默认 false, 因为 IHG Akamai 会拦截无头浏览器)")
     parser.add_argument("--output", default=OUTPUT_CSV, help="输出 CSV 文件名")
     parser.add_argument("--regions-only", action="store_true",
                         help="只列出所有二级链接，不实际抓取酒店")
