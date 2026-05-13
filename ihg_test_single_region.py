@@ -1,13 +1,15 @@
 """
-IHG 单区域测试脚本 v2
-- 只展开 "US & Canada"
-- 收集二级链接
-- 只访问第一个二级链接
-- 拦截 GraphQL 请求提取酒店代码 + 点击 "View More Hotels"
+IHG 单区域测试脚本 v3
+按层级抓取: /explore → 展开区域 → 二级国家/地区页 → 提取 /hoteldetail URL → hotelMnemonic
 
-策略: 用 page.on("request") 监听所有发往 apis.ihg.com/graphql/v1/hotels 的请求,
-从 request body 的 hotelMnemonic 数组中提取酒店代码。
-同时反复点击 "View More Hotels" 触发新的 GraphQL 请求。
+逻辑:
+1. 访问 /explore, 滚动到底部
+2. 逐个展开区域 (US & Canada, Europe, Asia 等)
+3. 每展开一个区域, 收集该区域的二级链接 (州/国家)
+4. 访问每个二级链接, 拦截 GraphQL + 点击 View More + 提取 DOM 中的酒店链接
+5. 输出带层级信息的酒店列表
+
+本次测试: 只展开 "US & Canada", 只访问前 2 个二级链接
 
 用法:
     python ihg_test_single_region.py
@@ -24,8 +26,54 @@ EXPLORE_URL = "https://www.ihg.com/explore"
 USER_DATA_DIR = "./ihg_browser_profile"
 GRAPHQL_URL = "apis.ihg.com/graphql"
 
+# 拦截到的酒店代码
+intercepted_mnemonics = set()
+
+
+def on_request(request):
+    """拦截 GraphQL 请求, 从 payload 中提取 hotelMnemonic 列表"""
+    if GRAPHQL_URL in request.url:
+        try:
+            body = request.post_data
+            if body and "hotelMnemonic" in body:
+                data = json.loads(body)
+                mnemonics = data.get("variables", {}).get("input", {}).get("hotelMnemonic", [])
+                if mnemonics:
+                    for mn in mnemonics:
+                        intercepted_mnemonics.add(mn.upper())
+                    print(f"    [拦截] GraphQL +{len(mnemonics)} 个代码 (累计: {len(intercepted_mnemonics)})")
+        except Exception:
+            pass
+
+
+def parse_region_from_slug(slug):
+    """从 URL slug 解析地理信息, 如 alabama-united-states → (Alabama, United States)"""
+    # 常见模式: <state>-<country> 或 <country> 或 <city>-<country>
+    parts = slug.replace("/", "").split("-")
+
+    # 尝试识别国家 (最后一个或两个词)
+    known_countries = {
+        "united-states": "United States", "canada": "Canada",
+        "united-kingdom": "United Kingdom", "france": "France",
+        "germany": "Germany", "italy": "Italy", "spain": "Spain",
+        "japan": "Japan", "china": "China", "thailand": "Thailand",
+        "australia": "Australia", "brazil": "Brazil", "mexico": "Mexico",
+        "india": "India", "singapore": "Singapore", "korea": "Korea",
+    }
+
+    slug_lower = slug.lower().strip("/")
+    for country_slug, country_name in known_countries.items():
+        if slug_lower.endswith(country_slug):
+            state_part = slug_lower[:-(len(country_slug))].rstrip("-")
+            state_name = state_part.replace("-", " ").title() if state_part else ""
+            return state_name, country_name
+
+    # 如果没匹配到已知国家, 把整个 slug 当作地区名
+    return slug.replace("-", " ").title(), ""
+
 
 def extract_mnemonic(url):
+    """从酒店 URL 提取 mnemonic"""
     if not url:
         return None
     m = re.search(r'/hotels/[a-z]{2}/[a-z]{2}/[^/]+/([a-zA-Z0-9]{4,6})(?:/hoteldetail|/index|/?$|/\?|$)', url)
@@ -40,27 +88,27 @@ def extract_mnemonic(url):
     return None
 
 
-async def main():
-    Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
+def extract_brand(url):
+    url_lower = url.lower()
+    patterns = {
+        "intercontinental": "IC", "regent": "RC", "sixsenses": "SR",
+        "kimptonhotels": "KI", "kimpton": "KI", "hotelindigo": "HT",
+        "voco": "VC", "crowneplaza": "CP", "evenhotels": "EH",
+        "holidayinnexpress": "EX", "holidayinnclubvacations": "CV",
+        "holidayinnresort": "RS", "holidayinn": "HI",
+        "garner-hotels": "GE", "garner": "GE",
+        "avidhotels": "AV", "atwellsuites": "AT",
+        "staybridge": "SB", "candlewood": "CW",
+    }
+    for key, code in sorted(patterns.items(), key=lambda x: -len(x[0])):
+        if f"/{key}/" in url_lower:
+            return code
+    return ""
 
-    # 用于收集从 GraphQL 请求中拦截到的酒店代码
-    intercepted_mnemonics = set()
 
-    def on_request(request):
-        """拦截 GraphQL 请求, 从 payload 中提取 hotelMnemonic 列表"""
-        if GRAPHQL_URL in request.url:
-            try:
-                body = request.post_data
-                if body and "hotelMnemonic" in body:
-                    data = json.loads(body)
-                    # 从 variables.input.hotelMnemonic 提取
-                    mnemonics = data.get("variables", {}).get("input", {}).get("hotelMnemonic", [])
-                    if mnemonics:
-                        for mn in mnemonics:
-                            intercepted_mnemonics.add(mn.upper())
-                        print(f"    [拦截] GraphQL 请求包含 {len(mnemonics)} 个酒店代码 (累计: {len(intercepted_mnemonics)})")
-            except Exception as e:
-                pass
+def extract_city(url):
+    m = re.search(r'/hotels/[a-z]{2}/[a-z]{2}/([^/]+)/[a-zA-Z0-9]{4,6}', url)
+    return m.group(1).replace("-", " ").title() if m else ""
 
 
 async def main():
@@ -80,11 +128,17 @@ async def main():
         """)
         page = await context.new_page()
 
-        # 注册请求拦截器 - 监听所有 GraphQL 请求
-        page.on("request", on_request)
+        # 只在进入二级页面后才开始拦截
+        graphql_active = False
+
+        def conditional_on_request(request):
+            if graphql_active:
+                on_request(request)
+
+        page.on("request", conditional_on_request)
 
         try:
-            # Step 1: 访问 /explore
+            # === Step 1: 访问 /explore ===
             print(f"\n[Step 1] 访问 {EXPLORE_URL}")
             await page.goto(EXPLORE_URL, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(3000)
@@ -94,7 +148,6 @@ async def main():
                 btn = page.get_by_role("button", name="Accept All", exact=False)
                 if await btn.count() > 0:
                     await btn.first.click(timeout=2000)
-                    print("    ✓ 关闭 cookie")
                     await page.wait_for_timeout(500)
             except Exception:
                 pass
@@ -106,14 +159,22 @@ async def main():
                 await page.wait_for_timeout(600)
             await page.wait_for_timeout(2000)
 
-            # Step 3: 只点击 "US & Canada"
-            print("[Step 3] 点击展开 'US & Canada'...")
+            # === Step 3: 只展开 "US & Canada" ===
+            region_name = "US & Canada"
+            print(f"[Step 3] 只展开 '{region_name}'...")
+
+            # 先收集展开前的链接 (排除基线)
+            links_before = set()
+            for lk in await page.evaluate("""() => [...document.querySelectorAll('a[href]')].map(a => a.href)"""):
+                links_before.add(lk)
+
+            # 点击展开
             clicked = await page.evaluate("""
-            async () => {
+            async (regionName) => {
                 const wait = (ms) => new Promise(r => setTimeout(r, ms));
                 const btns = [...document.querySelectorAll('button.cmp-accordion__button')];
                 for (const b of btns) {
-                    if (b.textContent.trim() === 'US & Canada') {
+                    if (b.textContent.trim() === regionName) {
                         b.scrollIntoView({behavior: 'instant', block: 'center'});
                         await wait(300);
                         b.click();
@@ -123,149 +184,151 @@ async def main():
                 }
                 return false;
             }
-            """)
+            """, region_name)
             print(f"    展开结果: {clicked}")
             await page.wait_for_timeout(2000)
 
-            # Step 4: 收集展开后的二级链接
-            print("[Step 4] 收集二级链接...")
-            links = await page.evaluate("""
+            # === Step 4: 收集该区域新出现的链接 ===
+            print(f"[Step 4] 收集 '{region_name}' 区域的二级链接...")
+            all_links_now = await page.evaluate("""
             () => {
                 const arr = [];
-                // cmp-list__item-link 是展开后目录链接的 class
-                for (const a of document.querySelectorAll('a.cmp-list__item-link, a[href*="ihg.com/"]')) {
-                    const href = a.href || '';
-                    const text = (a.textContent || '').trim();
-                    // 只要 ihg.com 根路径的单段 slug (如 /alabama-united-states)
-                    try {
-                        const path = new URL(href).pathname.replace(/\\/$/, '');
-                        if (path && !path.includes('/hotels/') && path.split('/').length === 2 && path.includes('-')) {
-                            arr.push({href, text});
-                        }
-                    } catch(e) {}
+                for (const a of document.querySelectorAll('a.cmp-list__item-link')) {
+                    arr.push({href: a.href, text: (a.textContent || '').trim()});
                 }
                 return arr;
             }
             """)
-            print(f"    找到 {len(links)} 个二级链接")
-            for lk in links[:5]:
-                print(f"      {lk['text']}: {lk['href']}")
-            if len(links) > 5:
-                print(f"      ... 还有 {len(links) - 5} 个")
 
-            if not links:
-                print("\n[!] 没有找到二级链接! 输出页面上所有 a 标签供分析...")
-                all_links = await page.evaluate("""
-                () => [...document.querySelectorAll('a[href]')].slice(0, 50).map(a => ({
-                    href: a.href, text: a.textContent.trim().slice(0, 60), class: a.className
-                }))
-                """)
-                with open("debug_all_links.json", "w", encoding="utf-8") as f:
-                    json.dump(all_links, f, indent=2, ensure_ascii=False)
-                print(f"    → 已保存 debug_all_links.json")
+            # 只保留展开后新出现的 cmp-list__item-link 链接
+            region_links = []
+            for lk in all_links_now:
+                href = lk["href"]
+                if href not in links_before:
+                    region_links.append(lk)
+
+            print(f"    '{region_name}' 下有 {len(region_links)} 个二级链接")
+            for lk in region_links[:5]:
+                print(f"      {lk['text']}: {lk['href']}")
+            if len(region_links) > 5:
+                print(f"      ... 还有 {len(region_links) - 5} 个")
+
+            if not region_links:
+                print("[!] 没有找到二级链接, 退出")
                 return
 
-            # Step 5: 只访问第一个二级链接
-            first_url = links[0]["href"]
-            print(f"\n[Step 5] 访问第一个二级链接: {first_url}")
-            await page.goto(first_url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(2000)
+            # === Step 5: 只访问前 2 个二级链接 ===
+            MAX_TEST = 2
+            all_hotels = []
 
-            # 滚动
-            for _ in range(3):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(500)
+            for idx, lk in enumerate(region_links[:MAX_TEST]):
+                url = lk["href"]
+                link_text = lk["text"]
+                slug = url.split("ihg.com/")[-1].strip("/")
+                state, country = parse_region_from_slug(slug)
 
-            # Step 6: 反复点击 "View More Hotels"
-            print("[Step 6] 反复点击 'View More Hotels'...")
-            total_clicks = 0
-            for round_num in range(50):
-                clicked = await page.evaluate("""
-                () => {
-                    const els = [...document.querySelectorAll('button, a, [role="button"]')];
-                    for (const el of els) {
-                        const t = (el.textContent || '').trim().toLowerCase();
-                        if (t.includes('view more') || t.includes('load more') || t.includes('show more')) {
-                            el.scrollIntoView({behavior: 'instant', block: 'center'});
-                            el.click();
-                            return true;
+                print(f"\n[Step 5.{idx+1}] 访问: {link_text} ({url})")
+                print(f"    解析: 区域={region_name}, 州/省={state}, 国家={country}")
+
+                # 开启 GraphQL 拦截
+                intercepted_mnemonics.clear()
+                graphql_active = True
+
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(2000)
+
+                # 滚动
+                for _ in range(3):
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(500)
+
+                # 点击 View More Hotels
+                view_more_clicks = 0
+                for _ in range(50):
+                    clicked_vm = await page.evaluate("""
+                    () => {
+                        const els = [...document.querySelectorAll('button, a, [role="button"]')];
+                        for (const el of els) {
+                            const t = (el.textContent || '').trim().toLowerCase();
+                            if (t.includes('view more') || t.includes('load more') || t.includes('show more')) {
+                                el.scrollIntoView({behavior: 'instant', block: 'center'});
+                                el.click();
+                                return true;
+                            }
                         }
+                        return false;
                     }
-                    return false;
+                    """)
+                    if not clicked_vm:
+                        break
+                    view_more_clicks += 1
+                    await page.wait_for_timeout(1500)
+
+                if view_more_clicks > 0:
+                    print(f"    点击了 {view_more_clicks} 次 View More")
+
+                # 关闭拦截
+                graphql_active = False
+                await page.wait_for_timeout(1000)
+
+                # 从 DOM 提取酒店链接
+                hotel_links = await page.evaluate("""
+                () => {
+                    const arr = [];
+                    for (const a of document.querySelectorAll('a[href*="/hoteldetail"]')) {
+                        arr.push({href: a.href, text: (a.textContent || '').trim().slice(0, 100)});
+                    }
+                    return arr;
                 }
                 """)
-                if not clicked:
-                    print(f"    第 {round_num + 1} 轮: 没有 'View More' 按钮了, 停止")
-                    break
-                total_clicks += 1
-                if total_clicks % 5 == 0:
-                    print(f"    已点击 {total_clicks} 次...")
-                await page.wait_for_timeout(1500)
 
-            print(f"    共点击 {total_clicks} 次 'View More Hotels'")
-            await page.wait_for_timeout(1000)
+                # 合并: DOM + GraphQL 拦截
+                page_hotels = {}
+                for hl in hotel_links:
+                    mn = extract_mnemonic(hl["href"])
+                    if mn and mn not in page_hotels:
+                        page_hotels[mn] = {
+                            "mnemonic": mn,
+                            "name": hl["text"].split("\n")[0].strip()[:80],
+                            "url": hl["href"],
+                            "brand_code": extract_brand(hl["href"]),
+                            "city": extract_city(hl["href"]),
+                            "region": region_name,
+                            "state": state,
+                            "country": country,
+                        }
 
-            # Step 7: 收集所有酒店链接 (从 DOM)
-            print("[Step 7] 从 DOM 收集酒店链接...")
-            all_hotel_links = await page.evaluate("""
-            () => {
-                const arr = [];
-                for (const a of document.querySelectorAll('a[href]')) {
-                    arr.push({href: a.href, text: (a.textContent || '').trim().slice(0, 100)});
-                }
-                return arr;
-            }
-            """)
+                # 补充 GraphQL 拦截到但 DOM 没有的
+                for mn in intercepted_mnemonics:
+                    if mn not in page_hotels:
+                        page_hotels[mn] = {
+                            "mnemonic": mn,
+                            "name": "",
+                            "url": "",
+                            "brand_code": "",
+                            "city": "",
+                            "region": region_name,
+                            "state": state,
+                            "country": country,
+                        }
 
-            dom_hotels = {}
-            for lk in all_hotel_links:
-                href = lk["href"]
-                m = re.search(r'/hotels/[a-z]{2}/[a-z]{2}/[^/]+/([a-zA-Z0-9]{4,6})(?:/hoteldetail|/index|/?$)', href)
-                if not m:
-                    m = re.search(
-                        r'/(?:intercontinental|regent|sixsenses|kimpton|hotelindigo|voco|crowneplaza|evenhotels|holidayinnexpress|holidayinnclubvacations|holidayinnresort|holidayinn|garner|garner-hotels|avidhotels|atwellsuites|staybridge|candlewood|iberostar|mrandmrssmith|vignettecollection|ruby|kimptonhotels)/hotels/[a-z]{2}/[a-z]{2}/[^/]+/([a-zA-Z0-9]{4,6})(?:/|$|\?)',
-                        href, re.IGNORECASE
-                    )
-                if m:
-                    mn = m.group(1).upper()
-                    if mn not in dom_hotels:
-                        dom_hotels[mn] = {"mnemonic": mn, "name": lk["text"], "url": href}
+                print(f"    结果: DOM={len(hotel_links)} 链接, GraphQL={len(intercepted_mnemonics)} 代码, 合并={len(page_hotels)} 唯一酒店")
+                all_hotels.extend(page_hotels.values())
 
-            # 合并: GraphQL 拦截 + DOM 提取
-            all_mnemonics = intercepted_mnemonics | set(dom_hotels.keys())
-
+            # === 最终输出 ===
             print(f"\n{'='*60}")
-            print(f"结果汇总:")
-            print(f"  GraphQL 拦截到的酒店代码: {len(intercepted_mnemonics)} 个")
-            print(f"  DOM 提取到的酒店链接:     {len(dom_hotels)} 个")
-            print(f"  合并去重后:               {len(all_mnemonics)} 个")
+            print(f"最终结果: 共 {len(all_hotels)} 个酒店")
             print(f"{'='*60}")
 
-            # 构建最终结果
-            hotels = []
-            for mn in sorted(all_mnemonics):
-                if mn in dom_hotels:
-                    hotels.append(dom_hotels[mn])
-                else:
-                    hotels.append({"mnemonic": mn, "name": "", "url": ""})
-
-            # 输出前 15 个
             print(f"\n前 15 个酒店:")
-            for h in hotels[:15]:
-                name = h['name'][:40] if h['name'] else "(仅代码)"
-                print(f"  {h['mnemonic']}: {name}")
-            if len(hotels) > 15:
-                print(f"  ... 还有 {len(hotels) - 15} 个")
+            for h in all_hotels[:15]:
+                loc = f"{h['city']}, {h['state']}, {h['country']}".strip(", ")
+                print(f"  {h['mnemonic']:6s} | {h['brand_code']:3s} | {loc[:30]:30s} | {h['name'][:30]}")
 
             # 保存
             with open("ihg_test_result.json", "w", encoding="utf-8") as f:
-                json.dump(hotels, f, indent=2, ensure_ascii=False)
-            print(f"\n[+] 完整结果已保存: ihg_test_result.json")
-
-            # 也单独保存拦截到的代码列表
-            with open("ihg_intercepted_codes.json", "w", encoding="utf-8") as f:
-                json.dump(sorted(list(intercepted_mnemonics)), f, indent=2)
-            print(f"[+] GraphQL 拦截代码列表: ihg_intercepted_codes.json")
+                json.dump(all_hotels, f, indent=2, ensure_ascii=False)
+            print(f"\n[+] 已保存: ihg_test_result.json")
 
         finally:
             await context.close()
