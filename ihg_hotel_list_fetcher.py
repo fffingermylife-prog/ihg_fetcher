@@ -496,6 +496,58 @@ async def crawl(debug=False, brand_filter=None, limit=None, do_bfs=True) -> List
                         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                         await page.wait_for_timeout(500)
 
+                    # 反复点击 "View More Hotels" 按钮直到没有更多
+                    view_more_clicks = 0
+                    for _ in range(50):  # 最多点 50 次, 避免无限循环
+                        try:
+                            # 尝试多种 "View More" 按钮文本
+                            view_more_btn = None
+                            for btn_text in ["View More Hotels", "View More", "Load More", "Show More"]:
+                                locator = page.get_by_role("button", name=btn_text, exact=False)
+                                if await locator.count() > 0:
+                                    view_more_btn = locator.first
+                                    break
+                                # 也尝试 link 角色
+                                locator = page.get_by_role("link", name=btn_text, exact=False)
+                                if await locator.count() > 0:
+                                    view_more_btn = locator.first
+                                    break
+
+                            if view_more_btn is None:
+                                # JS 兜底: 查找包含 "view more" 文本的可点击元素
+                                found = await page.evaluate("""
+                                () => {
+                                    const els = [...document.querySelectorAll('button, a, [role="button"]')];
+                                    for (const el of els) {
+                                        const t = (el.textContent || '').trim().toLowerCase();
+                                        if (t.includes('view more') || t.includes('load more') || t.includes('show more')) {
+                                            el.scrollIntoView({behavior: 'instant', block: 'center'});
+                                            el.click();
+                                            return true;
+                                        }
+                                    }
+                                    return false;
+                                }
+                                """)
+                                if found:
+                                    view_more_clicks += 1
+                                    await page.wait_for_timeout(1500)
+                                    continue
+                                else:
+                                    break  # 没有 View More 按钮了
+
+                            await view_more_btn.scroll_into_view_if_needed(timeout=3000)
+                            await page.wait_for_timeout(300)
+                            await view_more_btn.click(timeout=3000)
+                            view_more_clicks += 1
+                            await page.wait_for_timeout(1500)  # 等待新酒店加载
+                        except Exception:
+                            break  # 点击失败, 没有更多了
+
+                    if view_more_clicks > 0:
+                        print(f"    ✓ 点击了 {view_more_clicks} 次 'View More Hotels'")
+                        await page.wait_for_timeout(1000)
+
                     await click_all_regions(page)
                     await page.wait_for_timeout(800)
 
