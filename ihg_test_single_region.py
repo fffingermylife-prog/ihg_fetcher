@@ -1,9 +1,13 @@
 """
-IHG 单区域测试脚本
+IHG 单区域测试脚本 v2
 - 只展开 "US & Canada"
 - 收集二级链接
 - 只访问第一个二级链接
-- 反复点击 "View More Hotels" 收集所有酒店
+- 拦截 GraphQL 请求提取酒店代码 + 点击 "View More Hotels"
+
+策略: 用 page.on("request") 监听所有发往 apis.ihg.com/graphql/v1/hotels 的请求,
+从 request body 的 hotelMnemonic 数组中提取酒店代码。
+同时反复点击 "View More Hotels" 触发新的 GraphQL 请求。
 
 用法:
     python ihg_test_single_region.py
@@ -18,6 +22,7 @@ from playwright.async_api import async_playwright
 
 EXPLORE_URL = "https://www.ihg.com/explore"
 USER_DATA_DIR = "./ihg_browser_profile"
+GRAPHQL_URL = "apis.ihg.com/graphql"
 
 
 def extract_mnemonic(url):
@@ -38,6 +43,29 @@ def extract_mnemonic(url):
 async def main():
     Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
 
+    # 用于收集从 GraphQL 请求中拦截到的酒店代码
+    intercepted_mnemonics = set()
+
+    def on_request(request):
+        """拦截 GraphQL 请求, 从 payload 中提取 hotelMnemonic 列表"""
+        if GRAPHQL_URL in request.url:
+            try:
+                body = request.post_data
+                if body and "hotelMnemonic" in body:
+                    data = json.loads(body)
+                    # 从 variables.input.hotelMnemonic 提取
+                    mnemonics = data.get("variables", {}).get("input", {}).get("hotelMnemonic", [])
+                    if mnemonics:
+                        for mn in mnemonics:
+                            intercepted_mnemonics.add(mn.upper())
+                        print(f"    [拦截] GraphQL 请求包含 {len(mnemonics)} 个酒店代码 (累计: {len(intercepted_mnemonics)})")
+            except Exception as e:
+                pass
+
+
+async def main():
+    Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
+
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             USER_DATA_DIR,
@@ -51,6 +79,9 @@ async def main():
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         """)
         page = await context.new_page()
+
+        # 注册请求拦截器 - 监听所有 GraphQL 请求
+        page.on("request", on_request)
 
         try:
             # Step 1: 访问 /explore
@@ -174,8 +205,8 @@ async def main():
             print(f"    共点击 {total_clicks} 次 'View More Hotels'")
             await page.wait_for_timeout(1000)
 
-            # Step 7: 收集所有酒店链接
-            print("[Step 7] 收集酒店链接...")
+            # Step 7: 收集所有酒店链接 (从 DOM)
+            print("[Step 7] 从 DOM 收集酒店链接...")
             all_hotel_links = await page.evaluate("""
             () => {
                 const arr = [];
@@ -186,10 +217,8 @@ async def main():
             }
             """)
 
-            hotels = []
-            seen = set()
+            dom_hotels = {}
             for lk in all_hotel_links:
-                # 手动提取 mnemonic
                 href = lk["href"]
                 m = re.search(r'/hotels/[a-z]{2}/[a-z]{2}/[^/]+/([a-zA-Z0-9]{4,6})(?:/hoteldetail|/index|/?$)', href)
                 if not m:
@@ -199,24 +228,44 @@ async def main():
                     )
                 if m:
                     mn = m.group(1).upper()
-                    if mn not in seen:
-                        seen.add(mn)
-                        hotels.append({"mnemonic": mn, "name": lk["text"], "url": href})
+                    if mn not in dom_hotels:
+                        dom_hotels[mn] = {"mnemonic": mn, "name": lk["text"], "url": href}
+
+            # 合并: GraphQL 拦截 + DOM 提取
+            all_mnemonics = intercepted_mnemonics | set(dom_hotels.keys())
 
             print(f"\n{'='*60}")
-            print(f"结果: 共收集 {len(hotels)} 个酒店")
+            print(f"结果汇总:")
+            print(f"  GraphQL 拦截到的酒店代码: {len(intercepted_mnemonics)} 个")
+            print(f"  DOM 提取到的酒店链接:     {len(dom_hotels)} 个")
+            print(f"  合并去重后:               {len(all_mnemonics)} 个")
             print(f"{'='*60}")
 
-            # 输出前 10 个
-            for h in hotels[:10]:
-                print(f"  {h['mnemonic']}: {h['name'][:50]}")
-            if len(hotels) > 10:
-                print(f"  ... 还有 {len(hotels) - 10} 个")
+            # 构建最终结果
+            hotels = []
+            for mn in sorted(all_mnemonics):
+                if mn in dom_hotels:
+                    hotels.append(dom_hotels[mn])
+                else:
+                    hotels.append({"mnemonic": mn, "name": "", "url": ""})
+
+            # 输出前 15 个
+            print(f"\n前 15 个酒店:")
+            for h in hotels[:15]:
+                name = h['name'][:40] if h['name'] else "(仅代码)"
+                print(f"  {h['mnemonic']}: {name}")
+            if len(hotels) > 15:
+                print(f"  ... 还有 {len(hotels) - 15} 个")
 
             # 保存
             with open("ihg_test_result.json", "w", encoding="utf-8") as f:
                 json.dump(hotels, f, indent=2, ensure_ascii=False)
             print(f"\n[+] 完整结果已保存: ihg_test_result.json")
+
+            # 也单独保存拦截到的代码列表
+            with open("ihg_intercepted_codes.json", "w", encoding="utf-8") as f:
+                json.dump(sorted(list(intercepted_mnemonics)), f, indent=2)
+            print(f"[+] GraphQL 拦截代码列表: ihg_intercepted_codes.json")
 
         finally:
             await context.close()
