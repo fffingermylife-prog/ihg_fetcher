@@ -122,7 +122,7 @@ def is_sub_region_link(href, text, parent_url):
     return False
 
 
-async def collect_hotels_from_page(page, delay=3.0):
+async def collect_hotels_from_page(page, delay=3.0, country=""):
     """
     在当前页面执行: 滚动 + View More 循环 → 提取所有酒店链接
     返回: (hotels_dict, view_more_clicks)
@@ -197,6 +197,7 @@ async def collect_hotels_from_page(page, delay=3.0):
                 "url": hl["href"],
                 "brand_code": extract_brand(hl["href"]),
                 "city": extract_city(hl["href"]),
+                "country": country,
             }
 
     return hotels, view_more_clicks
@@ -398,7 +399,9 @@ async def main():
 
                 # === Step 6: 先在主页面收集酒店 (View More) ===
                 print(f"\n[Step 6] 在主页面 ({target_link['text']}) 收集酒店...")
-                main_hotels, main_vm_clicks = await collect_hotels_from_page(page)
+                # 从目标名称提取国家 (如 "Vietnam Hotels" → "Vietnam")
+                target_country = target_link['text'].replace(" Hotels", "").strip()
+                main_hotels, main_vm_clicks = await collect_hotels_from_page(page, country=target_country)
                 print(f"    主页面酒店: {len(main_hotels)} 个 (View More: {main_vm_clicks} 次)")
                 for mn, info in main_hotels.items():
                     if mn not in all_hotels:
@@ -438,7 +441,7 @@ async def main():
                             continue
                         await page.wait_for_timeout(2000)
 
-                        sub_hotels, sub_vm = await collect_hotels_from_page(page)
+                        sub_hotels, sub_vm = await collect_hotels_from_page(page, country=target_country)
                         new_count = 0
                         for mn, info in sub_hotels.items():
                             if mn not in all_hotels:
