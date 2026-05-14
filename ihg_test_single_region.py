@@ -483,22 +483,48 @@ async def main():
 
                 print(f"\n    [{target_link['text']}] 完成, 当前累计: {len(all_hotels)} 个唯一酒店")
 
-            # === 最终输出 ===
+            # === 最终输出: 按国家分组, 每个国家内按评分从高到低排序 ===
+            hotels_list = list(all_hotels.values())
+
+            # 排序: 先按国家, 再按评分从高到低 (无评分的排最后)
+            def sort_key(h):
+                country = h.get("country", "")
+                rating_str = h.get("rating", "")
+                try:
+                    rating = float(rating_str)
+                except (ValueError, TypeError):
+                    rating = 0.0
+                return (country, -rating)
+
+            hotels_list.sort(key=sort_key)
+
             print(f"\n{'='*60}")
             print(f"最终结果:")
             print(f"  目标: {', '.join(targets)}")
-            print(f"  总唯一酒店: {len(all_hotels)} 个")
+            print(f"  总唯一酒店: {len(hotels_list)} 个")
             print(f"{'='*60}")
 
-            print(f"\n前 20 个酒店:")
-            for h in list(all_hotels.values())[:20]:
-                print(f"  {h['mnemonic']:6s} | {h['brand_code']:3s} | {h['city'][:20]:20s} | {h['name'][:35]}")
+            # 按国家分组显示
+            current_country = None
+            shown = 0
+            for h in hotels_list:
+                if h["country"] != current_country:
+                    current_country = h["country"]
+                    print(f"\n  [{current_country}]")
+                if shown < 30:
+                    rating_str = h['rating'] if h['rating'] else '-'
+                    review_str = h['review_count'] if h['review_count'] else '-'
+                    print(f"    {h['mnemonic']:6s} | {h['brand_code']:3s} | {rating_str:>5s} | {review_str:>5s} reviews | {h['city'][:15]:15s} | {h['name'][:35]}")
+                    shown += 1
+
+            if len(hotels_list) > 30:
+                print(f"\n    ... 共 {len(hotels_list)} 个酒店, 详见输出文件")
 
             # 保存
             result = {
                 "targets": targets,
-                "total_hotels": len(all_hotels),
-                "hotels": list(all_hotels.values()),
+                "total_hotels": len(hotels_list),
+                "hotels": hotels_list,
             }
             with open(args.output, "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
