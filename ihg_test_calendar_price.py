@@ -59,24 +59,43 @@ def iter_date_windows(start_date, total_days, window_size):
 
 async def fetch_calendar(page, hotel_code, start_date, end_date, points_mode=False):
     """在浏览器上下文中调用 Calendar API (和官网完全一致的 payload)"""
-    payload = {
-        "hotelMnemonics": [hotel_code],
-        "startDate": start_date,
-        "endDate": end_date,
-        "lengthOfStay": 1,
-        "guestCounts": [
-            {"otaCode": "AQC10", "count": 1},
-            {"otaCode": "AQC8", "count": 0},
-        ],
-        "options": {
-            "identifyLowestOfferPerRatePlan": True,
-            "returnAmountsAfterTaxForLowestOffer": True,
-            "lowestOfferPerRatePlan": True,
-            "returnAverages": True,
-        },
-    }
     if points_mode:
-        payload["rates"] = {"ratePlanCodes": POINTS_RATE_PLAN_CODES}
+        # 积分请求: 和官网积分模式完全一致
+        payload = {
+            "hotelMnemonics": [hotel_code],
+            "startDate": start_date,
+            "endDate": end_date,
+            "lengthOfStay": 1,
+            "guestCounts": [
+                {"otaCode": "AQC10", "count": 1},
+            ],
+            "options": {
+                "includeSellStrategy": "followChannel",
+                "returnAmountsAfterTaxForLowestOffer": True,
+                "returnAverages": True,
+                "lowestOfferPerRatePlan": True,
+                "identifyLowestOfferPerRatePlan": True,
+            },
+            "rates": {"ratePlanCodes": POINTS_RATE_PLAN_CODES},
+        }
+    else:
+        # 现金请求: 和官网现金模式完全一致
+        payload = {
+            "hotelMnemonics": [hotel_code],
+            "startDate": start_date,
+            "endDate": end_date,
+            "lengthOfStay": 1,
+            "guestCounts": [
+                {"otaCode": "AQC10", "count": 1},
+                {"otaCode": "AQC8", "count": 0},
+            ],
+            "options": {
+                "identifyLowestOfferPerRatePlan": True,
+                "returnAmountsAfterTaxForLowestOffer": True,
+                "lowestOfferPerRatePlan": True,
+                "returnAverages": True,
+            },
+        }
 
     result = await page.evaluate("""
     async ({ apiKey, payload }) => {
