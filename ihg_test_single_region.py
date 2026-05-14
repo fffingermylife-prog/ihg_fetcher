@@ -281,36 +281,37 @@ async def main():
                 await page.wait_for_timeout(600)
             await page.wait_for_timeout(2000)
 
-            # === Step 3: 展开 "Asia" ===
-            region_name = "Asia"
-            print(f"[Step 3] 展开 '{region_name}'...")
+            # === Step 3: 展开 "Asia" (中文版可能显示为 "Asia亚洲") ===
+            region_keyword = "Asia"
+            print(f"[Step 3] 展开含 '{region_keyword}' 的区域...")
 
             clicked = await page.evaluate("""
-            async (regionName) => {
+            async (keyword) => {
                 const wait = (ms) => new Promise(r => setTimeout(r, ms));
                 const btns = [...document.querySelectorAll('button.cmp-accordion__button')];
                 for (const b of btns) {
-                    if (b.textContent.trim() === regionName) {
+                    if (b.textContent.trim().includes(keyword)) {
                         b.scrollIntoView({behavior: 'instant', block: 'center'});
                         await wait(300);
                         b.click();
                         await wait(2000);
-                        return true;
+                        return b.textContent.trim();
                     }
                 }
                 return false;
             }
-            """, region_name)
+            """, region_keyword)
             print(f"    展开结果: {clicked}")
             await page.wait_for_timeout(2000)
 
             # === Step 4: 收集 Asia 区域的二级链接 ===
+            region_name = clicked if clicked else "Asia"
             print(f"[Step 4] 收集 '{region_name}' 区域的二级链接...")
             region_links = await page.evaluate("""
-            (regionName) => {
+            (keyword) => {
                 const arr = [];
                 const btns = [...document.querySelectorAll('button.cmp-accordion__button')];
-                const btn = btns.find(b => b.textContent.trim() === regionName);
+                const btn = btns.find(b => b.textContent.trim().includes(keyword));
                 if (!btn) return arr;
 
                 const header = btn.closest('.cmp-accordion__header') || btn.parentElement;
@@ -327,7 +328,7 @@ async def main():
                 }
                 return arr;
             }
-            """, region_name)
+            """, region_keyword)
 
             print(f"    '{region_name}' 下有 {len(region_links)} 个二级链接:")
             for lk in region_links:
