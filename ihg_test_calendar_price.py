@@ -259,7 +259,7 @@ async def main():
     start = date.today() + timedelta(days=1)
     windows = iter_date_windows(start, args.days, WINDOW_SIZE_DAYS)
     print(f"\n  日期范围: {start} ~ {start + timedelta(days=args.days - 1)}")
-    print(f"  滑动窗口: {len(windows)} 个 (每个 {WINDOW_SIZE_DAYS} 天)")
+    print(f"  请求次数: 现金 {len(windows)} 次 + 积分 {len(windows)} 次")
 
     Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -279,42 +279,39 @@ async def main():
         page = await context.new_page()
 
         try:
-            # 建立 session: 先访问 IHG 网站
+            # 建立 session
             print(f"\n[1] 建立浏览器 session...")
             await page.goto("https://www.ihg.com/hotels/us/en/find-hotels/hotel/rates",
                             wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(3000)
-            print("    ✓ Session 已建立")
+            print("    ✓ OK")
 
             # 获取现金价格
-            print(f"\n[2] 获取现金价格 ({len(windows)} 个窗口)...")
+            print(f"[2] 获取现金价格...", end="", flush=True)
             all_cash = []
             for idx, (ws, we) in enumerate(windows, 1):
-                print(f"    [{idx}/{len(windows)}] {ws} ~ {we} (现金)")
                 resp = await fetch_calendar(page, hotel_code, ws, we, points_mode=False)
                 cash = parse_cash(resp)
                 all_cash.extend(cash)
+                print(f" {idx}", end="", flush=True)
                 await page.wait_for_timeout(REQUEST_DELAY_MS)
-
-            print(f"    ✓ 现金: {len(all_cash)} 天, 有价格: {sum(1 for c in all_cash if c['cash_price'])} 天")
+            print(f" ✓ ({len(all_cash)} 天)")
 
             # 获取积分价格
-            print(f"\n[3] 获取积分价格 ({len(windows)} 个窗口)...")
+            print(f"[3] 获取积分价格...", end="", flush=True)
             all_points = []
             for idx, (ws, we) in enumerate(windows, 1):
-                print(f"    [{idx}/{len(windows)}] {ws} ~ {we} (积分)")
                 resp = await fetch_calendar(page, hotel_code, ws, we, points_mode=True)
                 pts = parse_points(resp)
                 all_points.extend(pts)
+                print(f" {idx}", end="", flush=True)
                 await page.wait_for_timeout(REQUEST_DELAY_MS)
-
-            print(f"    ✓ 积分: {len(all_points)} 天, 有积分: {sum(1 for p in all_points if p['points'])} 天")
+            print(f" ✓ ({len(all_points)} 天)")
 
         finally:
             await context.close()
 
     # 合并结果
-    print(f"\n[4] 合并结果...")
     cash_map = {c["date"]: c for c in all_cash}
     points_map = {p["date"]: p for p in all_points}
     all_dates = sorted(set(cash_map.keys()) | set(points_map.keys()))
@@ -339,37 +336,29 @@ async def main():
             "cpp": cpp,
         })
 
-    # 输出统计
+    # 输出全部日期表格
     has_cash = sum(1 for m in merged if m["cash_price"])
     has_points = sum(1 for m in merged if m["points"])
     has_both = sum(1 for m in merged if m["cash_price"] and m["points"])
 
     print(f"\n{'='*60}")
-    print(f"结果统计 ({hotel_code}):")
-    print(f"  总天数: {len(merged)}")
-    print(f"  有现金价: {has_cash} 天")
-    print(f"  有积分价: {has_points} 天")
-    print(f"  有两者 (可算CPP): {has_both} 天")
+    print(f"{'日期':12s} | {'现金':>10s} | {'货币':4s} | {'积分':>8s} | {'CPP':>6s}")
+    print(f"{'-'*60}")
+    for m in merged:
+        cash_str = f"{m['cash_price']:.2f}" if m["cash_price"] else ""
+        pts_str = f"{m['points']}" if m["points"] else ""
+        cpp_str = f"{m['cpp']:.2f}" if m["cpp"] else ""
+        print(f"{m['date']:12s} | {cash_str:>10s} | {m['currency']:4s} | {pts_str:>8s} | {cpp_str:>6s}")
+
+    print(f"{'-'*60}")
+    print(f"总计: {len(merged)} 天, 有现金价 {has_cash} 天, 有积分价 {has_points} 天, 可算CPP {has_both} 天")
 
     if has_both > 0:
         cpps = [m["cpp"] for m in merged if m["cpp"]]
         avg_cpp = sum(cpps) / len(cpps) if cpps else 0
         min_cpp = min(cpps) if cpps else 0
         max_cpp = max(cpps) if cpps else 0
-        print(f"\n  CPP 统计 (每万积分价值):")
-        print(f"    平均: {avg_cpp:.2f} 分/点")
-        print(f"    最低: {min_cpp:.2f} 分/点")
-        print(f"    最高: {max_cpp:.2f} 分/点")
-
-    # 显示前 10 天
-    print(f"\n  前 10 天:")
-    print(f"  {'日期':12s} | {'现金':>8s} | {'货币':4s} | {'积分':>8s} | {'CPP':>6s}")
-    print(f"  {'-'*50}")
-    for m in merged[:10]:
-        cash_str = f"{m['cash_price']:.0f}" if m["cash_price"] else "-"
-        pts_str = f"{m['points']}" if m["points"] else "-"
-        cpp_str = f"{m['cpp']:.2f}" if m["cpp"] else "-"
-        print(f"  {m['date']:12s} | {cash_str:>8s} | {m['currency']:4s} | {pts_str:>8s} | {cpp_str:>6s}")
+        print(f"CPP: 平均 {avg_cpp:.2f} | 最低 {min_cpp:.2f} | 最高 {max_cpp:.2f}")
 
     print(f"{'='*60}")
 
