@@ -204,19 +204,55 @@ async def collect_hotels_from_page(page, delay=3.0):
 
 async def collect_sub_region_links(page, current_url):
     """
-    收集当前页面底部的子区域链接
+    收集 "Hotels by State / Region" 区块内的子区域链接
+    只在该标题对应的容器内提取, 不收集页面其他位置的链接
     返回: [{href, text}, ...]
     """
     links = await page.evaluate("""
     (currentUrl) => {
         const arr = [];
         const seen = new Set();
-        // 收集页面所有链接
-        for (const a of document.querySelectorAll('a[href]')) {
+
+        // 策略1: 找到 "Hotels by State" 或 "Hotels by Region" 标题, 然后取其父容器内的链接
+        const headings = [...document.querySelectorAll('h2, h3, h4, [class*="heading"], [class*="title"]')];
+        let container = null;
+        for (const h of headings) {
+            const t = (h.textContent || '').trim().toLowerCase();
+            if (t.includes('hotels by state') || t.includes('hotels by region') ||
+                t.includes('hotels by city') || t.includes('hotels by area')) {
+                // 容器是标题的父元素或下一个兄弟
+                container = h.parentElement;
+                // 如果父元素太小(没有链接), 尝试往上一层
+                if (container && container.querySelectorAll('a').length < 3) {
+                    container = container.parentElement;
+                }
+                break;
+            }
+        }
+
+        // 策略2: 如果没找到标题, 尝试找 class 含 "region" 或 "state" 的区块
+        if (!container) {
+            const sections = document.querySelectorAll('[class*="region"], [class*="state"], [class*="destination-links"]');
+            for (const s of sections) {
+                if (s.querySelectorAll('a').length >= 3) {
+                    container = s;
+                    break;
+                }
+            }
+        }
+
+        if (!container) return arr;
+
+        // 从容器内提取链接
+        for (const a of container.querySelectorAll('a[href]')) {
             const href = a.href || '';
             const text = (a.textContent || '').trim();
             if (!href || !text) continue;
             if (seen.has(href)) continue;
+            // 排除酒店详情链接
+            if (href.includes('/hoteldetail') || href.includes('/hotels/')) continue;
+            // 排除当前页面自身
+            if (href.replace(/\/$/, '') === currentUrl.replace(/\/$/, '')) continue;
             seen.add(href);
             arr.push({href, text});
         }
@@ -224,17 +260,7 @@ async def collect_sub_region_links(page, current_url):
     }
     """, current_url)
 
-    # 过滤出子区域链接
-    sub_links = []
-    seen_hrefs = set()
-    for lk in links:
-        if lk["href"] in seen_hrefs:
-            continue
-        if is_sub_region_link(lk["href"], lk["text"], current_url):
-            seen_hrefs.add(lk["href"])
-            sub_links.append(lk)
-
-    return sub_links
+    return links
 
 
 async def main():
