@@ -1,23 +1,19 @@
 """
 IHG 单区域测试脚本 v4 - 支持多层子区域递归
-验证场景: Asia → Mainland China → 页面下方子区域链接 → 收集所有酒店
-
-发现的问题:
-    大区域 (如 Mainland China) 的 View More 可能不会显示全部酒店，
-    页面下方还有子区域链接 (如北京、上海、广东等)，需要进一步点进去收集。
-
-逻辑:
-    1. 访问 /explore, 滚动到底部
-    2. 展开 "Asia" 区域
-    3. 访问 "Mainland China Hotels" 链接
-    4. 在该页面:
-       a) 先 View More 收集当前页酒店
-       b) 检测页面下方的子区域链接 (排除已知的酒店详情链接)
-       c) 逐个访问子区域 → View More → 收集酒店
-    5. 输出结果, 对比有/无子区域递归的数量差异
+支持通过 --target 参数指定要收集的二级区域
 
 用法:
+    # 默认收集 Mainland China
     python ihg_test_single_region.py
+
+    # 收集 Vietnam 和 Hong Kong
+    python ihg_test_single_region.py --target "Vietnam Hotels,Hong Kong SAR Hotels"
+
+    # 收集欧洲区域下的 France
+    python ihg_test_single_region.py --region "Europe" --target "France Hotels"
+
+    # 指定输出文件
+    python ihg_test_single_region.py --target "Vietnam Hotels" --output vietnam.json
 """
 
 import asyncio
@@ -242,6 +238,20 @@ async def collect_sub_region_links(page, current_url):
 
 
 async def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="IHG 单区域测试 - 支持子区域递归收集")
+    parser.add_argument("--target", type=str, default="Mainland China Hotels",
+                        help='目标二级链接名称, 多个用逗号分隔 (如 "Vietnam Hotels,Hong Kong SAR Hotels")')
+    parser.add_argument("--region", type=str, default="Asia",
+                        help='大区域关键词, 用于展开 accordion (默认 Asia)')
+    parser.add_argument("--output", type=str, default="ihg_test_result.json",
+                        help='输出 JSON 文件名')
+    args = parser.parse_args()
+
+    # 解析多个目标
+    targets = [t.strip() for t in args.target.split(",") if t.strip()]
+    region_keyword = args.region
+
     Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as p:
@@ -281,8 +291,7 @@ async def main():
                 await page.wait_for_timeout(600)
             await page.wait_for_timeout(2000)
 
-            # === Step 3: 展开 "Asia" (中文版可能显示为 "Asia亚洲") ===
-            region_keyword = "Asia"
+            # === Step 3: 展开目标大区域 ===
             print(f"[Step 3] 展开含 '{region_keyword}' 的区域...")
 
             clicked = await page.evaluate("""
@@ -334,85 +343,86 @@ async def main():
             for lk in region_links:
                 print(f"      {lk['text']}: {lk['href']}")
 
-            # === Step 5: 找到 "Mainland China" 并访问 ===
-            china_link = None
-            for lk in region_links:
-                if "china" in lk["text"].lower() or "china" in lk["href"].lower():
-                    china_link = lk
-                    break
-                # 中文版可能显示为 "中国大陆"
-                if "中国" in lk["text"]:
-                    china_link = lk
-                    break
+            # === Step 5: 找到目标二级链接并逐个处理 ===
+            all_hotels = {}  # 全局去重
 
-            if not china_link:
-                print("[!] 没有找到 Mainland China 链接!")
-                return
+            for target_name in targets:
+                target_link = None
+                target_lower = target_name.lower()
+                for lk in region_links:
+                    if target_lower in lk["text"].lower() or target_lower in lk["href"].lower():
+                        target_link = lk
+                        break
 
-            china_url = china_link["href"]
-            print(f"\n[Step 5] 访问: {china_link['text']} ({china_url})")
+                if not target_link:
+                    print(f"\n[!] 没有找到匹配 '{target_name}' 的链接, 跳过")
+                    continue
 
-            await page.goto(china_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(2000)
+                target_url = target_link["href"]
+                print(f"\n[Step 5] 访问: {target_link['text']} ({target_url})")
 
-            # === Step 6: 先在主页面收集酒店 (View More) ===
-            print(f"\n[Step 6] 在主页面 (Mainland China) 收集酒店...")
-            main_hotels, main_vm_clicks = await collect_hotels_from_page(page)
-            print(f"    主页面酒店: {len(main_hotels)} 个 (View More: {main_vm_clicks} 次)")
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(2000)
 
-            # === Step 7: 收集页面下方的子区域链接 ===
-            print(f"\n[Step 7] 检测子区域链接...")
-            sub_links = await collect_sub_region_links(page, china_url)
-            print(f"    发现 {len(sub_links)} 个子区域链接:")
-            for lk in sub_links[:20]:
-                print(f"      {lk['text']:30s} → {lk['href']}")
-            if len(sub_links) > 20:
-                print(f"      ... 还有 {len(sub_links) - 20} 个")
+                # === Step 6: 先在主页面收集酒店 (View More) ===
+                print(f"\n[Step 6] 在主页面 ({target_link['text']}) 收集酒店...")
+                main_hotels, main_vm_clicks = await collect_hotels_from_page(page)
+                print(f"    主页面酒店: {len(main_hotels)} 个 (View More: {main_vm_clicks} 次)")
+                for mn, info in main_hotels.items():
+                    if mn not in all_hotels:
+                        all_hotels[mn] = info
 
-            # === Step 8: 逐个访问所有子区域, 收集酒店 ===
-            all_hotels = dict(main_hotels)  # 从主页面的酒店开始
+                # === Step 7: 收集页面下方的子区域链接 ===
+                print(f"\n[Step 7] 检测子区域链接...")
+                sub_links = await collect_sub_region_links(page, target_url)
+                print(f"    发现 {len(sub_links)} 个子区域链接:")
+                for lk in sub_links[:20]:
+                    print(f"      {lk['text']:30s} → {lk['href']}")
+                if len(sub_links) > 20:
+                    print(f"      ... 还有 {len(sub_links) - 20} 个")
 
-            if sub_links:
-                print(f"\n[Step 8] 访问所有 {len(sub_links)} 个子区域...")
+                # === Step 8: 逐个访问所有子区域, 收集酒店 ===
+                if sub_links:
+                    print(f"\n[Step 8] 访问所有 {len(sub_links)} 个子区域...")
 
-                for idx, lk in enumerate(sub_links, 1):
-                    print(f"\n  [8.{idx}/{len(sub_links)}] {lk['text']} → {lk['href']}")
+                    for idx, lk in enumerate(sub_links, 1):
+                        print(f"\n  [8.{idx}/{len(sub_links)}] {lk['text']} → {lk['href']}")
 
-                    # 加载子区域页面, 超时 60 秒, 失败重试 1 次
-                    loaded = False
-                    for attempt in range(2):
-                        try:
-                            await page.goto(lk["href"], wait_until="domcontentloaded", timeout=60000)
-                            loaded = True
-                            break
-                        except Exception as e:
-                            if attempt == 0:
-                                print(f"    [!] 第1次超时, 重试...")
-                                await page.wait_for_timeout(2000)
-                            else:
-                                print(f"    [!] 加载失败 (已重试): {e}")
+                        # 加载子区域页面, 超时 60 秒, 失败重试 1 次
+                        loaded = False
+                        for attempt in range(2):
+                            try:
+                                await page.goto(lk["href"], wait_until="domcontentloaded", timeout=60000)
+                                loaded = True
+                                break
+                            except Exception as e:
+                                if attempt == 0:
+                                    print(f"    [!] 第1次超时, 重试...")
+                                    await page.wait_for_timeout(2000)
+                                else:
+                                    print(f"    [!] 加载失败 (已重试): {e}")
 
-                    if not loaded:
-                        continue
-                    await page.wait_for_timeout(2000)
+                        if not loaded:
+                            continue
+                        await page.wait_for_timeout(2000)
 
-                    sub_hotels, sub_vm = await collect_hotels_from_page(page)
-                    new_count = 0
-                    for mn, info in sub_hotels.items():
-                        if mn not in all_hotels:
-                            all_hotels[mn] = info
-                            new_count += 1
+                        sub_hotels, sub_vm = await collect_hotels_from_page(page)
+                        new_count = 0
+                        for mn, info in sub_hotels.items():
+                            if mn not in all_hotels:
+                                all_hotels[mn] = info
+                                new_count += 1
 
-                    print(f"    结果: {len(sub_hotels)} 个酒店, {new_count} 个新增 (View More: {sub_vm} 次)")
-                    print(f"    累计: {len(all_hotels)} 个唯一酒店")
+                        print(f"    结果: {len(sub_hotels)} 个酒店, {new_count} 个新增 (View More: {sub_vm} 次)")
+                        print(f"    累计: {len(all_hotels)} 个唯一酒店")
+
+                print(f"\n    [{target_link['text']}] 完成, 当前累计: {len(all_hotels)} 个唯一酒店")
 
             # === 最终输出 ===
             print(f"\n{'='*60}")
-            print(f"对比结果:")
-            print(f"  只靠主页面 View More: {len(main_hotels)} 个酒店")
-            print(f"  加上所有子区域后:     {len(all_hotels)} 个酒店")
-            print(f"  增加了:              {len(all_hotels) - len(main_hotels)} 个")
-            print(f"  子区域总数:          {len(sub_links)} 个")
+            print(f"最终结果:")
+            print(f"  目标: {', '.join(targets)}")
+            print(f"  总唯一酒店: {len(all_hotels)} 个")
             print(f"{'='*60}")
 
             print(f"\n前 20 个酒店:")
@@ -421,16 +431,13 @@ async def main():
 
             # 保存
             result = {
-                "main_page_count": len(main_hotels),
-                "total_with_sub_regions": len(all_hotels),
-                "sub_region_links_found": len(sub_links),
-                "sub_regions_visited": len(sub_links),
-                "sub_region_links": sub_links,
+                "targets": targets,
+                "total_hotels": len(all_hotels),
                 "hotels": list(all_hotels.values()),
             }
-            with open("ihg_test_china_result.json", "w", encoding="utf-8") as f:
+            with open(args.output, "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
-            print(f"\n[+] 已保存: ihg_test_china_result.json")
+            print(f"\n[+] 已保存: {args.output}")
 
         finally:
             await context.close()
