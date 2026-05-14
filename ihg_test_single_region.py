@@ -1,15 +1,20 @@
 """
-IHG 单区域测试脚本 v3
-按层级抓取: /explore → 展开区域 → 二级国家/地区页 → 提取 /hoteldetail URL → hotelMnemonic
+IHG 单区域测试脚本 v4 - 支持多层子区域递归
+验证场景: Asia → Mainland China → 页面下方子区域链接 → 收集所有酒店
+
+发现的问题:
+    大区域 (如 Mainland China) 的 View More 可能不会显示全部酒店，
+    页面下方还有子区域链接 (如北京、上海、广东等)，需要进一步点进去收集。
 
 逻辑:
-1. 访问 /explore, 滚动到底部
-2. 逐个展开区域 (US & Canada, Europe, Asia 等)
-3. 每展开一个区域, 收集该区域的二级链接 (州/国家)
-4. 访问每个二级链接, 拦截 GraphQL + 点击 View More + 提取 DOM 中的酒店链接
-5. 输出带层级信息的酒店列表
-
-本次测试: 只展开 "US & Canada", 只访问前 2 个二级链接
+    1. 访问 /explore, 滚动到底部
+    2. 展开 "Asia" 区域
+    3. 访问 "Mainland China Hotels" 链接
+    4. 在该页面:
+       a) 先 View More 收集当前页酒店
+       b) 检测页面下方的子区域链接 (排除已知的酒店详情链接)
+       c) 逐个访问子区域 → View More → 收集酒店
+    5. 输出结果, 对比有/无子区域递归的数量差异
 
 用法:
     python ihg_test_single_region.py
@@ -24,52 +29,6 @@ from playwright.async_api import async_playwright
 
 EXPLORE_URL = "https://www.ihg.com/explore"
 USER_DATA_DIR = "./ihg_browser_profile"
-GRAPHQL_URL = "apis.ihg.com/graphql"
-
-# 拦截到的酒店代码
-intercepted_mnemonics = set()
-
-
-def on_request(request):
-    """拦截 GraphQL 请求, 从 payload 中提取 hotelMnemonic 列表"""
-    if GRAPHQL_URL in request.url:
-        try:
-            body = request.post_data
-            if body and "hotelMnemonic" in body:
-                data = json.loads(body)
-                mnemonics = data.get("variables", {}).get("input", {}).get("hotelMnemonic", [])
-                if mnemonics:
-                    for mn in mnemonics:
-                        intercepted_mnemonics.add(mn.upper())
-                    print(f"    [拦截] GraphQL +{len(mnemonics)} 个代码 (累计: {len(intercepted_mnemonics)})")
-        except Exception:
-            pass
-
-
-def parse_region_from_slug(slug):
-    """从 URL slug 解析地理信息, 如 alabama-united-states → (Alabama, United States)"""
-    # 常见模式: <state>-<country> 或 <country> 或 <city>-<country>
-    parts = slug.replace("/", "").split("-")
-
-    # 尝试识别国家 (最后一个或两个词)
-    known_countries = {
-        "united-states": "United States", "canada": "Canada",
-        "united-kingdom": "United Kingdom", "france": "France",
-        "germany": "Germany", "italy": "Italy", "spain": "Spain",
-        "japan": "Japan", "china": "China", "thailand": "Thailand",
-        "australia": "Australia", "brazil": "Brazil", "mexico": "Mexico",
-        "india": "India", "singapore": "Singapore", "korea": "Korea",
-    }
-
-    slug_lower = slug.lower().strip("/")
-    for country_slug, country_name in known_countries.items():
-        if slug_lower.endswith(country_slug):
-            state_part = slug_lower[:-(len(country_slug))].rstrip("-")
-            state_name = state_part.replace("-", " ").title() if state_part else ""
-            return state_name, country_name
-
-    # 如果没匹配到已知国家, 把整个 slug 当作地区名
-    return slug.replace("-", " ").title(), ""
 
 
 def extract_mnemonic(url):
@@ -80,7 +39,10 @@ def extract_mnemonic(url):
     if m:
         return m.group(1).upper()
     m = re.search(
-        r'/(?:intercontinental|regent|sixsenses|kimpton|hotelindigo|voco|crowneplaza|evenhotels|holidayinnexpress|holidayinnclubvacations|holidayinnresort|holidayinn|garner|garner-hotels|avidhotels|atwellsuites|staybridge|candlewood|iberostar|mrandmrssmith|vignettecollection|ruby|kimptonhotels)/hotels/[a-z]{2}/[a-z]{2}/[^/]+/([a-zA-Z0-9]{4,6})(?:/|$|\?)',
+        r'/(?:intercontinental|regent|sixsenses|kimpton|hotelindigo|voco|crowneplaza|evenhotels|'
+        r'holidayinnexpress|holidayinnclubvacations|holidayinnresort|holidayinn|garner|garner-hotels|'
+        r'avidhotels|atwellsuites|staybridge|candlewood|iberostar|mrandmrssmith|vignettecollection|'
+        r'ruby|kimptonhotels)/hotels/[a-z]{2}/[a-z]{2}/[^/]+/([a-zA-Z0-9]{4,6})(?:/|$|\?)',
         url, re.IGNORECASE
     )
     if m:
@@ -111,6 +73,174 @@ def extract_city(url):
     return m.group(1).replace("-", " ").title() if m else ""
 
 
+def is_sub_region_link(href, text, parent_url):
+    """
+    判断一个链接是否是子区域链接 (而非酒店详情链接)
+    子区域链接特征:
+      - 在 ihg.com 域名下
+      - 不包含 /hoteldetail, /hotels/, /reservation 等
+      - 是类似 /beijing-china, /shanghai-china 的地理 slug
+      - 文本通常含 "Hotels" 结尾
+    """
+    href_lower = href.lower()
+    text_lower = text.lower()
+
+    # 必须是 ihg.com 域名
+    if "ihg.com" not in href_lower:
+        return False
+
+    # 排除酒店详情页
+    if "/hoteldetail" in href_lower or "/hotels/" in href_lower:
+        return False
+
+    # 排除功能性页面
+    excludes = [
+        "/reservation", "/checkout", "/account", "/signin",
+        "/legal", "/rewards", "/about", "/content", "/offers",
+        "/customer-care", "/careers", "/development",
+        ".pdf", ".jpg", ".png",
+    ]
+    if any(x in href_lower for x in excludes):
+        return False
+
+    # 排除当前页面自身
+    if href.rstrip("/") == parent_url.rstrip("/"):
+        return False
+
+    # 文本太短或太长可能不是区域链接
+    if len(text) < 3 or len(text) > 60:
+        return False
+
+    # 通常子区域链接文本含 "Hotels" (如 "Beijing Hotels", "Shanghai Hotels")
+    # 或者是一个地理名称
+    if "hotel" in text_lower:
+        return True
+
+    # 检查 URL slug 格式: ihg.com/<slug> 单段路径, 含连字符
+    from urllib.parse import urlparse
+    path = urlparse(href).path.strip("/")
+    # 单段路径 (不含 /) 且含连字符 → 很可能是地理位置
+    if "/" not in path and "-" in path and len(path) > 5:
+        return True
+
+    return False
+
+
+async def collect_hotels_from_page(page, delay=3.0):
+    """
+    在当前页面执行: 滚动 + View More 循环 → 提取所有酒店链接
+    返回: (hotels_dict, view_more_clicks)
+    """
+    # 初始滚动
+    for _ in range(3):
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(500)
+
+    # 智能循环
+    view_more_clicks = 0
+    prev_count = 0
+    no_change_rounds = 0
+
+    while True:
+        current_count = await page.evaluate("""
+        () => document.querySelectorAll('a[href*="/hoteldetail"]').length
+        """)
+
+        if current_count > prev_count:
+            no_change_rounds = 0
+            prev_count = current_count
+        else:
+            no_change_rounds += 1
+
+        if no_change_rounds >= 2:
+            break
+
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(800)
+
+        clicked_vm = await page.evaluate("""
+        () => {
+            const els = [...document.querySelectorAll('button, a, [role="button"]')];
+            for (const el of els) {
+                const t = (el.textContent || '').trim().toLowerCase();
+                if (t.includes('view more') || t.includes('load more') || t.includes('show more')) {
+                    el.scrollIntoView({behavior: 'instant', block: 'center'});
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }
+        """)
+
+        if clicked_vm:
+            view_more_clicks += 1
+            await page.wait_for_timeout(int(delay * 1000))
+        else:
+            await page.wait_for_timeout(1000)
+            break
+
+    # 提取酒店链接
+    hotel_links = await page.evaluate("""
+    () => {
+        const arr = [];
+        for (const a of document.querySelectorAll('a[href*="/hoteldetail"]')) {
+            arr.push({href: a.href, text: (a.textContent || '').trim().slice(0, 100)});
+        }
+        return arr;
+    }
+    """)
+
+    hotels = {}
+    for hl in hotel_links:
+        mn = extract_mnemonic(hl["href"])
+        if mn and mn not in hotels:
+            hotels[mn] = {
+                "mnemonic": mn,
+                "name": hl["text"].split("\n")[0].strip()[:80],
+                "url": hl["href"],
+                "brand_code": extract_brand(hl["href"]),
+                "city": extract_city(hl["href"]),
+            }
+
+    return hotels, view_more_clicks
+
+
+async def collect_sub_region_links(page, current_url):
+    """
+    收集当前页面底部的子区域链接
+    返回: [{href, text}, ...]
+    """
+    links = await page.evaluate("""
+    (currentUrl) => {
+        const arr = [];
+        const seen = new Set();
+        // 收集页面所有链接
+        for (const a of document.querySelectorAll('a[href]')) {
+            const href = a.href || '';
+            const text = (a.textContent || '').trim();
+            if (!href || !text) continue;
+            if (seen.has(href)) continue;
+            seen.add(href);
+            arr.push({href, text});
+        }
+        return arr;
+    }
+    """, current_url)
+
+    # 过滤出子区域链接
+    sub_links = []
+    seen_hrefs = set()
+    for lk in links:
+        if lk["href"] in seen_hrefs:
+            continue
+        if is_sub_region_link(lk["href"], lk["text"], current_url):
+            seen_hrefs.add(lk["href"])
+            sub_links.append(lk)
+
+    return sub_links
+
+
 async def main():
     Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -118,7 +248,8 @@ async def main():
         context = await p.chromium.launch_persistent_context(
             USER_DATA_DIR,
             headless=False,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 900},
             locale="en-US",
             args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
@@ -127,15 +258,6 @@ async def main():
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         """)
         page = await context.new_page()
-
-        # 只在进入二级页面后才开始拦截
-        graphql_active = False
-
-        def conditional_on_request(request):
-            if graphql_active:
-                on_request(request)
-
-        page.on("request", conditional_on_request)
 
         try:
             # === Step 1: 访问 /explore ===
@@ -159,11 +281,10 @@ async def main():
                 await page.wait_for_timeout(600)
             await page.wait_for_timeout(2000)
 
-            # === Step 3: 只展开 "US & Canada" ===
-            region_name = "US & Canada"
-            print(f"[Step 3] 只展开 '{region_name}'...")
+            # === Step 3: 展开 "Asia" ===
+            region_name = "Asia"
+            print(f"[Step 3] 展开 '{region_name}'...")
 
-            # 点击展开
             clicked = await page.evaluate("""
             async (regionName) => {
                 const wait = (ms) => new Promise(r => setTimeout(r, ms));
@@ -183,22 +304,19 @@ async def main():
             print(f"    展开结果: {clicked}")
             await page.wait_for_timeout(2000)
 
-            # === Step 4: 从展开的面板中直接提取链接 ===
+            # === Step 4: 收集 Asia 区域的二级链接 ===
             print(f"[Step 4] 收集 '{region_name}' 区域的二级链接...")
             region_links = await page.evaluate("""
             (regionName) => {
                 const arr = [];
-                // 找到该区域的按钮
                 const btns = [...document.querySelectorAll('button.cmp-accordion__button')];
                 const btn = btns.find(b => b.textContent.trim() === regionName);
                 if (!btn) return arr;
-                
-                // 按钮在 H3.cmp-accordion__header 里, 面板是 H3 的下一个兄弟 DIV
+
                 const header = btn.closest('.cmp-accordion__header') || btn.parentElement;
                 const panel = header?.nextElementSibling;
                 if (!panel) return arr;
-                
-                // 从面板中提取所有链接
+
                 const links = panel.querySelectorAll('a');
                 for (const a of links) {
                     const href = a.href || '';
@@ -211,140 +329,97 @@ async def main():
             }
             """, region_name)
 
-            print(f"    '{region_name}' 下有 {len(region_links)} 个二级链接")
-            for lk in region_links[:5]:
+            print(f"    '{region_name}' 下有 {len(region_links)} 个二级链接:")
+            for lk in region_links:
                 print(f"      {lk['text']}: {lk['href']}")
-            if len(region_links) > 5:
-                print(f"      ... 还有 {len(region_links) - 5} 个")
 
-            if not region_links:
-                print("[!] 没有找到二级链接, 退出")
+            # === Step 5: 找到 "Mainland China" 并访问 ===
+            china_link = None
+            for lk in region_links:
+                if "china" in lk["text"].lower() or "china" in lk["href"].lower():
+                    china_link = lk
+                    break
+
+            if not china_link:
+                print("[!] 没有找到 Mainland China 链接!")
                 return
 
-            # === Step 5: 只访问前 2 个二级链接 ===
-            MAX_TEST = 2
-            all_hotels = []
+            china_url = china_link["href"]
+            print(f"\n[Step 5] 访问: {china_link['text']} ({china_url})")
 
-            for idx, lk in enumerate(region_links[:MAX_TEST]):
-                url = lk["href"]
-                link_text = lk["text"]
-                slug = url.split("ihg.com/")[-1].strip("/")
-                state, country = parse_region_from_slug(slug)
+            await page.goto(china_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2000)
 
-                print(f"\n[Step 5.{idx+1}] 访问: {link_text} ({url})")
-                print(f"    解析: 区域={region_name}, 州/省={state}, 国家={country}")
+            # === Step 6: 先在主页面收集酒店 (View More) ===
+            print(f"\n[Step 6] 在主页面 (Mainland China) 收集酒店...")
+            main_hotels, main_vm_clicks = await collect_hotels_from_page(page)
+            print(f"    主页面酒店: {len(main_hotels)} 个 (View More: {main_vm_clicks} 次)")
 
-                # 开启收集
-                graphql_active = False  # 暂不拦截 GraphQL
+            # === Step 7: 收集页面下方的子区域链接 ===
+            print(f"\n[Step 7] 检测子区域链接...")
+            sub_links = await collect_sub_region_links(page, china_url)
+            print(f"    发现 {len(sub_links)} 个子区域链接:")
+            for lk in sub_links[:20]:
+                print(f"      {lk['text']:30s} → {lk['href']}")
+            if len(sub_links) > 20:
+                print(f"      ... 还有 {len(sub_links) - 20} 个")
 
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(2000)
+            # === Step 8: 逐个访问子区域, 收集酒店 ===
+            all_hotels = dict(main_hotels)  # 从主页面的酒店开始
 
-                # 初始滚动
-                for _ in range(3):
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(500)
+            if sub_links:
+                # 测试: 只访问前 5 个子区域
+                MAX_SUB_TEST = 5
+                print(f"\n[Step 8] 访问子区域 (测试: 前 {MAX_SUB_TEST} 个)...")
 
-                # 循环: 提取酒店 → 滚动 → 点击 View More → 等待新卡片 → 重复直到数量不再增加
-                view_more_clicks = 0
-                prev_count = 0
-                no_change_rounds = 0
+                for idx, lk in enumerate(sub_links[:MAX_SUB_TEST], 1):
+                    print(f"\n  [8.{idx}] {lk['text']} → {lk['href']}")
 
-                while True:
-                    # 提取当前酒店数量
-                    current_count = await page.evaluate("""
-                    () => document.querySelectorAll('a[href*="/hoteldetail"]').length
-                    """)
+                    try:
+                        await page.goto(lk["href"], wait_until="domcontentloaded", timeout=30000)
+                    except Exception as e:
+                        print(f"    [!] 加载失败: {e}")
+                        continue
+                    await page.wait_for_timeout(2000)
 
-                    if current_count > prev_count:
-                        no_change_rounds = 0
-                        prev_count = current_count
-                    else:
-                        no_change_rounds += 1
+                    sub_hotels, sub_vm = await collect_hotels_from_page(page)
+                    new_count = 0
+                    for mn, info in sub_hotels.items():
+                        if mn not in all_hotels:
+                            all_hotels[mn] = info
+                            new_count += 1
 
-                    # 连续 2 轮没有新增, 停止
-                    if no_change_rounds >= 2:
-                        break
-
-                    # 滚动到底部
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(800)
-
-                    # 尝试点击 View More Hotels
-                    clicked_vm = await page.evaluate("""
-                    () => {
-                        const els = [...document.querySelectorAll('button, a, [role="button"]')];
-                        for (const el of els) {
-                            const t = (el.textContent || '').trim().toLowerCase();
-                            if (t.includes('view more') || t.includes('load more') || t.includes('show more')) {
-                                el.scrollIntoView({behavior: 'instant', block: 'center'});
-                                el.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    }
-                    """)
-
-                    if clicked_vm:
-                        view_more_clicks += 1
-                        await page.wait_for_timeout(1500)  # 等新卡片加载
-                    else:
-                        # 没有按钮了, 再等一下确认
-                        await page.wait_for_timeout(1000)
-                        break
-
-                if view_more_clicks > 0:
-                    print(f"    点击了 {view_more_clicks} 次 View More, 最终 {prev_count} 个酒店卡片")
-
-                # 关闭拦截
-                graphql_active = False
-                await page.wait_for_timeout(500)
-
-                # 从 DOM 提取酒店链接
-                hotel_links = await page.evaluate("""
-                () => {
-                    const arr = [];
-                    for (const a of document.querySelectorAll('a[href*="/hoteldetail"]')) {
-                        arr.push({href: a.href, text: (a.textContent || '').trim().slice(0, 100)});
-                    }
-                    return arr;
-                }
-                """)
-
-                # 提取酒店信息
-                page_hotels = {}
-                for hl in hotel_links:
-                    mn = extract_mnemonic(hl["href"])
-                    if mn and mn not in page_hotels:
-                        page_hotels[mn] = {
-                            "mnemonic": mn,
-                            "name": hl["text"].split("\n")[0].strip()[:80],
-                            "url": hl["href"],
-                            "brand_code": extract_brand(hl["href"]),
-                            "city": extract_city(hl["href"]),
-                            "region": region_name,
-                            "state": state,
-                            "country": country,
-                        }
-
-                print(f"    结果: 共 {len(page_hotels)} 个唯一酒店")
-                all_hotels.extend(page_hotels.values())
+                    print(f"    结果: {len(sub_hotels)} 个酒店, {new_count} 个新增 (View More: {sub_vm} 次)")
+                    print(f"    累计: {len(all_hotels)} 个唯一酒店")
 
             # === 最终输出 ===
             print(f"\n{'='*60}")
-            print(f"最终结果: 共 {len(all_hotels)} 个酒店")
+            print(f"对比结果:")
+            print(f"  只靠主页面 View More: {len(main_hotels)} 个酒店")
+            print(f"  加上子区域递归后:     {len(all_hotels)} 个酒店")
+            print(f"  增加了:              {len(all_hotels) - len(main_hotels)} 个")
             print(f"{'='*60}")
 
-            print(f"\n前 15 个酒店:")
-            for h in all_hotels[:15]:
-                loc = f"{h['city']}, {h['state']}, {h['country']}".strip(", ")
-                print(f"  {h['mnemonic']:6s} | {h['brand_code']:3s} | {loc[:30]:30s} | {h['name'][:30]}")
+            if len(sub_links) > MAX_SUB_TEST:
+                print(f"\n  注意: 还有 {len(sub_links) - MAX_SUB_TEST} 个子区域未访问!")
+                print(f"  完整抓取预计酒店数量会更多")
+
+            print(f"\n前 20 个酒店:")
+            for h in list(all_hotels.values())[:20]:
+                print(f"  {h['mnemonic']:6s} | {h['brand_code']:3s} | {h['city'][:20]:20s} | {h['name'][:35]}")
 
             # 保存
-            with open("ihg_test_result.json", "w", encoding="utf-8") as f:
-                json.dump(all_hotels, f, indent=2, ensure_ascii=False)
-            print(f"\n[+] 已保存: ihg_test_result.json")
+            result = {
+                "main_page_count": len(main_hotels),
+                "total_with_sub_regions": len(all_hotels),
+                "sub_region_links_found": len(sub_links),
+                "sub_regions_visited": min(len(sub_links), MAX_SUB_TEST),
+                "sub_region_links": sub_links,
+                "hotels": list(all_hotels.values()),
+            }
+            with open("ihg_test_china_result.json", "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            print(f"\n[+] 已保存: ihg_test_china_result.json")
 
         finally:
             await context.close()
