@@ -364,16 +364,14 @@ async def main():
             if len(sub_links) > 20:
                 print(f"      ... 还有 {len(sub_links) - 20} 个")
 
-            # === Step 8: 逐个访问子区域, 收集酒店 ===
+            # === Step 8: 逐个访问所有子区域, 收集酒店 ===
             all_hotels = dict(main_hotels)  # 从主页面的酒店开始
 
             if sub_links:
-                # 测试: 只访问前 5 个子区域
-                MAX_SUB_TEST = 5
-                print(f"\n[Step 8] 访问子区域 (测试: 前 {MAX_SUB_TEST} 个)...")
+                print(f"\n[Step 8] 访问所有 {len(sub_links)} 个子区域...")
 
-                for idx, lk in enumerate(sub_links[:MAX_SUB_TEST], 1):
-                    print(f"\n  [8.{idx}] {lk['text']} → {lk['href']}")
+                for idx, lk in enumerate(sub_links, 1):
+                    print(f"\n  [8.{idx}/{len(sub_links)}] {lk['text']} → {lk['href']}")
 
                     try:
                         await page.goto(lk["href"], wait_until="domcontentloaded", timeout=30000)
@@ -396,13 +394,10 @@ async def main():
             print(f"\n{'='*60}")
             print(f"对比结果:")
             print(f"  只靠主页面 View More: {len(main_hotels)} 个酒店")
-            print(f"  加上子区域递归后:     {len(all_hotels)} 个酒店")
+            print(f"  加上所有子区域后:     {len(all_hotels)} 个酒店")
             print(f"  增加了:              {len(all_hotels) - len(main_hotels)} 个")
+            print(f"  子区域总数:          {len(sub_links)} 个")
             print(f"{'='*60}")
-
-            if len(sub_links) > MAX_SUB_TEST:
-                print(f"\n  注意: 还有 {len(sub_links) - MAX_SUB_TEST} 个子区域未访问!")
-                print(f"  完整抓取预计酒店数量会更多")
 
             print(f"\n前 20 个酒店:")
             for h in list(all_hotels.values())[:20]:
@@ -413,7 +408,7 @@ async def main():
                 "main_page_count": len(main_hotels),
                 "total_with_sub_regions": len(all_hotels),
                 "sub_region_links_found": len(sub_links),
-                "sub_regions_visited": min(len(sub_links), MAX_SUB_TEST),
+                "sub_regions_visited": len(sub_links),
                 "sub_region_links": sub_links,
                 "hotels": list(all_hotels.values()),
             }
