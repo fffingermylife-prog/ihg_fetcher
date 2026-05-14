@@ -24,13 +24,15 @@ async def fetch_raw(page, hotel_code, start_date, end_date, points_mode=False):
         "startDate": start_date,
         "endDate": end_date,
         "lengthOfStay": 1,
-        "guestCounts": [{"otaCode": "AQC10", "count": 1}],
+        "guestCounts": [
+            {"otaCode": "AQC10", "count": 1},
+            {"otaCode": "AQC8", "count": 0},
+        ],
         "options": {
-            "includeSellStrategy": "followChannel",
-            "returnAmountsAfterTaxForLowestOffer": True,
-            "returnAverages": True,
-            "lowestOfferPerRatePlan": True,
             "identifyLowestOfferPerRatePlan": True,
+            "returnAmountsAfterTaxForLowestOffer": True,
+            "lowestOfferPerRatePlan": True,
+            "returnAverages": True,
         },
     }
     if points_mode:

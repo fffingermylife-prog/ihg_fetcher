@@ -35,8 +35,8 @@ USER_DATA_DIR = "./ihg_browser_profile"
 API_KEY = "se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y"
 POINTS_RATE_PLAN_CODES = ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"]
 
-# 滑动窗口
-WINDOW_SIZE_DAYS = 60
+# 滑动窗口 (和官网一致: 每次 2 个月)
+WINDOW_SIZE_DAYS = 62
 REQUEST_DELAY_MS = 2000
 
 # Seed URL (用于建立浏览器 session)
@@ -58,19 +58,21 @@ def iter_date_windows(start_date, total_days, window_size):
 
 
 async def fetch_calendar(page, hotel_code, start_date, end_date, points_mode=False):
-    """在浏览器上下文中调用 Calendar API"""
+    """在浏览器上下文中调用 Calendar API (和官网完全一致的 payload)"""
     payload = {
         "hotelMnemonics": [hotel_code],
         "startDate": start_date,
         "endDate": end_date,
         "lengthOfStay": 1,
-        "guestCounts": [{"otaCode": "AQC10", "count": 1}],
+        "guestCounts": [
+            {"otaCode": "AQC10", "count": 1},
+            {"otaCode": "AQC8", "count": 0},
+        ],
         "options": {
-            "includeSellStrategy": "followChannel",
-            "returnAmountsAfterTaxForLowestOffer": True,
-            "returnAverages": True,
-            "lowestOfferPerRatePlan": True,
             "identifyLowestOfferPerRatePlan": True,
+            "returnAmountsAfterTaxForLowestOffer": True,
+            "lowestOfferPerRatePlan": True,
+            "returnAverages": True,
         },
     }
     if points_mode:
