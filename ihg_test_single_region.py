@@ -27,7 +27,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 
-EXPLORE_URL = "https://www.ihg.com/explore"
+EXPLORE_URL = "https://www.ihg.com/zh-cn/explore"
 USER_DATA_DIR = "./ihg_browser_profile"
 
 
@@ -339,6 +339,10 @@ async def main():
                 if "china" in lk["text"].lower() or "china" in lk["href"].lower():
                     china_link = lk
                     break
+                # 中文版可能显示为 "中国大陆"
+                if "中国" in lk["text"]:
+                    china_link = lk
+                    break
 
             if not china_link:
                 print("[!] 没有找到 Mainland China 链接!")
@@ -347,7 +351,7 @@ async def main():
             china_url = china_link["href"]
             print(f"\n[Step 5] 访问: {china_link['text']} ({china_url})")
 
-            await page.goto(china_url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(china_url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(2000)
 
             # === Step 6: 先在主页面收集酒店 (View More) ===
@@ -373,10 +377,21 @@ async def main():
                 for idx, lk in enumerate(sub_links, 1):
                     print(f"\n  [8.{idx}/{len(sub_links)}] {lk['text']} → {lk['href']}")
 
-                    try:
-                        await page.goto(lk["href"], wait_until="domcontentloaded", timeout=30000)
-                    except Exception as e:
-                        print(f"    [!] 加载失败: {e}")
+                    # 加载子区域页面, 超时 60 秒, 失败重试 1 次
+                    loaded = False
+                    for attempt in range(2):
+                        try:
+                            await page.goto(lk["href"], wait_until="domcontentloaded", timeout=60000)
+                            loaded = True
+                            break
+                        except Exception as e:
+                            if attempt == 0:
+                                print(f"    [!] 第1次超时, 重试...")
+                                await page.wait_for_timeout(2000)
+                            else:
+                                print(f"    [!] 加载失败 (已重试): {e}")
+
+                    if not loaded:
                         continue
                     await page.wait_for_timeout(2000)
 
