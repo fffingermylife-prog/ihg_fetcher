@@ -27,7 +27,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 
-EXPLORE_URL = "https://www.ihg.com/zh-cn/explore"
+EXPLORE_URL = "https://www.ihg.com/explore"
 USER_DATA_DIR = "./ihg_browser_profile"
 
 
