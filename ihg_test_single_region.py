@@ -292,6 +292,12 @@ async def main():
             await page.wait_for_timeout(2000)
 
             # === Step 3: 展开目标大区域 ===
+            # 先诊断: 打印所有 accordion 按钮文本
+            all_btns = await page.evaluate("""
+            () => [...document.querySelectorAll('button.cmp-accordion__button')].map(b => b.textContent.trim())
+            """)
+            print(f"    [诊断] 页面上所有 accordion 按钮: {all_btns}")
+
             print(f"[Step 3] 展开含 '{region_keyword}' 的区域...")
 
             clicked = await page.evaluate("""
