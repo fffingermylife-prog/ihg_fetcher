@@ -118,8 +118,21 @@ async def fetch_calendar(page, hotel_code, start_date, end_date, points_mode=Fal
         return None
 
 
+def expand_date_range(start_str, end_str):
+    """展开日期区间为逐天列表 (含首尾)"""
+    from datetime import date, timedelta
+    start = date.fromisoformat(start_str)
+    end = date.fromisoformat(end_str)
+    dates = []
+    current = start
+    while current <= end:
+        dates.append(current.isoformat())
+        current += timedelta(days=1)
+    return dates
+
+
 def parse_cash(response_data):
-    """解析现金价格响应"""
+    """解析现金价格响应 (展开日期区间)"""
     results = []
     if not response_data:
         return results
@@ -135,16 +148,22 @@ def parse_cash(response_data):
                 except (ValueError, TypeError):
                     price = None
                 cur = lr.get("currency", currency)
-            results.append({
-                "date": day.get("start", ""),
-                "cash_price": price,
-                "currency": cur,
-            })
+
+            # 展开 start ~ end 区间
+            start_d = day.get("start", "")
+            end_d = day.get("end", start_d)  # 没有 end 则等于 start
+            if start_d:
+                for d in expand_date_range(start_d, end_d):
+                    results.append({
+                        "date": d,
+                        "cash_price": price,
+                        "currency": cur,
+                    })
     return results
 
 
 def parse_points(response_data):
-    """解析积分价格响应"""
+    """解析积分价格响应 (展开日期区间)"""
     results = []
     if not response_data:
         return results
@@ -168,10 +187,16 @@ def parse_points(response_data):
                                 lowest = v
                         except (ValueError, TypeError):
                             pass
-            results.append({
-                "date": day.get("start", ""),
-                "points": int(lowest) if lowest else None,
-            })
+
+            # 展开 start ~ end 区间
+            start_d = day.get("start", "")
+            end_d = day.get("end", start_d)
+            if start_d:
+                for d in expand_date_range(start_d, end_d):
+                    results.append({
+                        "date": d,
+                        "points": int(lowest) if lowest else None,
+                    })
     return results
 
 
