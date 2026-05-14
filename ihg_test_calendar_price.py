@@ -151,7 +151,7 @@ def expand_date_range(start_str, end_str):
 
 
 def parse_cash(response_data):
-    """解析现金价格响应 (展开日期区间)"""
+    """解析现金价格响应 (展开日期区间, 含税+不含税)"""
     results = []
     if not response_data:
         return results
@@ -159,14 +159,31 @@ def parse_cash(response_data):
         currency = hotel.get("hotel", {}).get("propertyCurrency", "")
         for day in hotel.get("calendar", []):
             lr = day.get("lowestRate")
+            offers = day.get("offers", [])
             price = None
+            price_after_tax = None
             cur = currency
+
             if lr:
+                cur = lr.get("currency", currency)
+                # lowestRate.totalAmount 是不含税最低价
                 try:
                     price = float(lr.get("totalAmount", 0)) or None
                 except (ValueError, TypeError):
                     price = None
-                cur = lr.get("currency", currency)
+
+                # 通过 refIds 找到对应 offer, 读取含税价
+                ref_ids = lr.get("refIds", [])
+                if ref_ids and offers:
+                    # 取第一个 refId 对应的 offer
+                    target_id = ref_ids[0]
+                    for offer in offers:
+                        if offer.get("id") == target_id:
+                            try:
+                                price_after_tax = float(offer.get("totalAmountAfterFeeTax", 0)) or None
+                            except (ValueError, TypeError):
+                                pass
+                            break
 
             # 展开 start ~ end 区间
             start_d = day.get("start", "")
@@ -176,6 +193,7 @@ def parse_cash(response_data):
                     results.append({
                         "date": d,
                         "cash_price": price,
+                        "cash_price_after_tax": price_after_tax,
                         "currency": cur,
                     })
     return results
@@ -321,16 +339,19 @@ async def main():
         cash = cash_map.get(d, {})
         pts = points_map.get(d, {})
         cash_price = cash.get("cash_price")
+        cash_price_after_tax = cash.get("cash_price_after_tax")
         points_price = pts.get("points")
 
-        # 计算 CPP (每点价值, 单位: 分)
+        # 计算 CPP (用含税价计算, 更准确)
         cpp = None
-        if cash_price and points_price and points_price > 0:
-            cpp = round(cash_price / points_price * 100, 2)
+        price_for_cpp = cash_price_after_tax or cash_price
+        if price_for_cpp and points_price and points_price > 0:
+            cpp = round(price_for_cpp / points_price * 100, 2)
 
         merged.append({
             "date": d,
             "cash_price": cash_price,
+            "cash_price_after_tax": cash_price_after_tax,
             "currency": cash.get("currency", ""),
             "points": points_price,
             "cpp": cpp,
@@ -341,16 +362,17 @@ async def main():
     has_points = sum(1 for m in merged if m["points"])
     has_both = sum(1 for m in merged if m["cash_price"] and m["points"])
 
-    print(f"\n{'='*60}")
-    print(f"{'日期':12s} | {'现金':>10s} | {'货币':4s} | {'积分':>8s} | {'CPP':>6s}")
-    print(f"{'-'*60}")
+    print(f"\n{'='*75}")
+    print(f"{'日期':12s} | {'不含税':>8s} | {'含税':>8s} | {'货币':4s} | {'积分':>8s} | {'CPP':>6s}")
+    print(f"{'-'*75}")
     for m in merged:
         cash_str = f"{m['cash_price']:.2f}" if m["cash_price"] else ""
+        tax_str = f"{m['cash_price_after_tax']:.2f}" if m["cash_price_after_tax"] else ""
         pts_str = f"{m['points']}" if m["points"] else ""
         cpp_str = f"{m['cpp']:.2f}" if m["cpp"] else ""
-        print(f"{m['date']:12s} | {cash_str:>10s} | {m['currency']:4s} | {pts_str:>8s} | {cpp_str:>6s}")
+        print(f"{m['date']:12s} | {cash_str:>8s} | {tax_str:>8s} | {m['currency']:4s} | {pts_str:>8s} | {cpp_str:>6s}")
 
-    print(f"{'-'*60}")
+    print(f"{'-'*75}")
     print(f"总计: {len(merged)} 天, 有现金价 {has_cash} 天, 有积分价 {has_points} 天, 可算CPP {has_both} 天")
 
     if has_both > 0:
@@ -358,9 +380,9 @@ async def main():
         avg_cpp = sum(cpps) / len(cpps) if cpps else 0
         min_cpp = min(cpps) if cpps else 0
         max_cpp = max(cpps) if cpps else 0
-        print(f"CPP: 平均 {avg_cpp:.2f} | 最低 {min_cpp:.2f} | 最高 {max_cpp:.2f}")
+        print(f"CPP(含税): 平均 {avg_cpp:.2f} | 最低 {min_cpp:.2f} | 最高 {max_cpp:.2f}")
 
-    print(f"{'='*60}")
+    print(f"{'='*75}")
 
     # 保存
     result = {
