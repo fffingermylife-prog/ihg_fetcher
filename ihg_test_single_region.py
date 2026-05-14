@@ -177,32 +177,37 @@ async def collect_hotels_from_page(page, delay=3.0, country=""):
             break
 
     # 提取酒店链接 + 卡片详情 (地址、评分、评价次数)
+    # 使用已验证的真实 DOM 结构:
+    #   - 地址: address.cmp-card__address
+    #   - 评分: span.cmp-card__rating-count (数字)
+    #   - 评价次数: a.cmp-card__rating-count (含 "xxx reviews")
+    #   - 备选: 从 script[type="application/ld+json"] 解析
     hotel_links = await page.evaluate("""
     () => {
         const arr = [];
-        for (const a of document.querySelectorAll('a[href*="/hoteldetail"]')) {
-            const href = a.href;
-            const name = (a.textContent || '').trim().slice(0, 100);
-            // 从酒店卡片父容器中提取更多信息
-            const card = a.closest('[class*="card"], [class*="hotel"], [class*="property"], li, article') || a.parentElement?.parentElement;
-            let address = '';
+        // 遍历每个酒店卡片 li.cmp-list__item
+        for (const li of document.querySelectorAll('li.cmp-list__item')) {
+            const linkEl = li.querySelector('a.cmp-card__title-link[href*="/hoteldetail"]');
+            if (!linkEl) continue;
+            const href = linkEl.href;
+            const name = linkEl.textContent.trim().slice(0, 100);
+
+            // 地址
+            const addrEl = li.querySelector('address.cmp-card__address');
+            const address = addrEl ? addrEl.textContent.trim().replace(/\\s+/g, ' ') : '';
+
+            // 评分和评价次数
             let rating = '';
             let reviewCount = '';
-            if (card) {
-                // 地址: 通常在含 address/location 的元素中
-                const addrEl = card.querySelector('[class*="address"], [class*="location"], [data-testid*="address"], address');
-                if (addrEl) address = addrEl.textContent.trim().slice(0, 150);
-                // 评分: 通常在含 rating/score 的元素中
-                const ratingEl = card.querySelector('[class*="rating"], [class*="score"], [data-testid*="rating"]');
-                if (ratingEl) rating = ratingEl.textContent.trim().replace(/[^0-9.]/g, '').slice(0, 5);
-                // 评价次数: 通常在含 review/count 的元素中
-                const reviewEl = card.querySelector('[class*="review"], [class*="count"], [data-testid*="review"]');
-                if (reviewEl) {
-                    const rt = reviewEl.textContent.trim();
-                    const m = rt.match(/([\\d,]+)/);
-                    if (m) reviewCount = m[1].replace(/,/g, '');
-                }
+            const ratingEl = li.querySelector('span.cmp-card__rating-count');
+            if (ratingEl) rating = ratingEl.textContent.trim();
+            const reviewEl = li.querySelector('a.cmp-card__rating-count');
+            if (reviewEl) {
+                const rt = reviewEl.textContent.trim();
+                const m = rt.match(/([\\d,]+)/);
+                if (m) reviewCount = m[1].replace(/,/g, '');
             }
+
             arr.push({href, name, address, rating, reviewCount});
         }
         return arr;
