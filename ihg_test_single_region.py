@@ -176,12 +176,34 @@ async def collect_hotels_from_page(page, delay=3.0, country=""):
             await page.wait_for_timeout(1000)
             break
 
-    # 提取酒店链接
+    # 提取酒店链接 + 卡片详情 (地址、评分、评价次数)
     hotel_links = await page.evaluate("""
     () => {
         const arr = [];
         for (const a of document.querySelectorAll('a[href*="/hoteldetail"]')) {
-            arr.push({href: a.href, text: (a.textContent || '').trim().slice(0, 100)});
+            const href = a.href;
+            const name = (a.textContent || '').trim().slice(0, 100);
+            // 从酒店卡片父容器中提取更多信息
+            const card = a.closest('[class*="card"], [class*="hotel"], [class*="property"], li, article') || a.parentElement?.parentElement;
+            let address = '';
+            let rating = '';
+            let reviewCount = '';
+            if (card) {
+                // 地址: 通常在含 address/location 的元素中
+                const addrEl = card.querySelector('[class*="address"], [class*="location"], [data-testid*="address"], address');
+                if (addrEl) address = addrEl.textContent.trim().slice(0, 150);
+                // 评分: 通常在含 rating/score 的元素中
+                const ratingEl = card.querySelector('[class*="rating"], [class*="score"], [data-testid*="rating"]');
+                if (ratingEl) rating = ratingEl.textContent.trim().replace(/[^0-9.]/g, '').slice(0, 5);
+                // 评价次数: 通常在含 review/count 的元素中
+                const reviewEl = card.querySelector('[class*="review"], [class*="count"], [data-testid*="review"]');
+                if (reviewEl) {
+                    const rt = reviewEl.textContent.trim();
+                    const m = rt.match(/([\\d,]+)/);
+                    if (m) reviewCount = m[1].replace(/,/g, '');
+                }
+            }
+            arr.push({href, name, address, rating, reviewCount});
         }
         return arr;
     }
@@ -193,11 +215,14 @@ async def collect_hotels_from_page(page, delay=3.0, country=""):
         if mn and mn not in hotels:
             hotels[mn] = {
                 "mnemonic": mn,
-                "name": hl["text"].split("\n")[0].strip()[:80],
+                "name": hl["name"].split("\n")[0].strip()[:80],
                 "url": hl["href"],
                 "brand_code": extract_brand(hl["href"]),
                 "city": extract_city(hl["href"]),
                 "country": country,
+                "address": hl.get("address", ""),
+                "rating": hl.get("rating", ""),
+                "review_count": hl.get("reviewCount", ""),
             }
 
     return hotels, view_more_clicks
@@ -394,7 +419,7 @@ async def main():
                 target_url = target_link["href"]
                 print(f"\n[Step 5] 访问: {target_link['text']} ({target_url})")
 
-                await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
                 await page.wait_for_timeout(2000)
 
                 # === Step 6: 先在主页面收集酒店 (View More) ===
@@ -423,19 +448,19 @@ async def main():
                     for idx, lk in enumerate(sub_links, 1):
                         print(f"\n  [8.{idx}/{len(sub_links)}] {lk['text']} → {lk['href']}")
 
-                        # 加载子区域页面, 超时 60 秒, 失败重试 1 次
+                        # 加载子区域页面, 超时 90 秒, 失败重试 3 次
                         loaded = False
-                        for attempt in range(2):
+                        for attempt in range(3):
                             try:
-                                await page.goto(lk["href"], wait_until="domcontentloaded", timeout=60000)
+                                await page.goto(lk["href"], wait_until="domcontentloaded", timeout=90000)
                                 loaded = True
                                 break
                             except Exception as e:
-                                if attempt == 0:
-                                    print(f"    [!] 第1次超时, 重试...")
-                                    await page.wait_for_timeout(2000)
+                                if attempt < 2:
+                                    print(f"    [!] 第{attempt+1}次超时, 重试...")
+                                    await page.wait_for_timeout(3000)
                                 else:
-                                    print(f"    [!] 加载失败 (已重试): {e}")
+                                    print(f"    [!] 加载失败 (已重试3次): {e}")
 
                         if not loaded:
                             continue
