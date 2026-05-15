@@ -170,6 +170,8 @@ async def fetch_calendar(page, hotel_code, start_date, end_date, points_mode=Fal
             return v.toString(16);
         });
         try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000);
             const resp = await fetch("https://apis.ihg.com/availability/v1/calendar", {
                 method: "POST",
                 headers: {
@@ -182,7 +184,9 @@ async def fetch_calendar(page, hotel_code, start_date, end_date, points_mode=Fal
                 },
                 body: JSON.stringify(payload),
                 credentials: "include",
+                signal: controller.signal,
             });
+            clearTimeout(timeout);
             const text = await resp.text();
             let json = null;
             try { json = JSON.parse(text); } catch (e) {}
@@ -450,9 +454,20 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run):
 
         while retries <= MAX_RETRIES:
             try:
-                prices = await fetch_hotel_prices(page, hotel_code, windows)
+                # 单酒店整体超时 120 秒 (正常约 6~8 秒)
+                prices = await asyncio.wait_for(
+                    fetch_hotel_prices(page, hotel_code, windows),
+                    timeout=120
+                )
                 success = True
                 break
+            except asyncio.TimeoutError:
+                retries += 1
+                if retries <= MAX_RETRIES:
+                    print(f"  [W{worker_id}] {hotel_code} 超时, 重试 ({retries}/{MAX_RETRIES})...")
+                    await page.wait_for_timeout(3000)
+                else:
+                    print(f"  [W{worker_id}] {hotel_code} 超时, 跳过")
             except Exception as e:
                 retries += 1
                 if retries <= MAX_RETRIES:
@@ -676,16 +691,14 @@ async def main():
             pages.append(page)
 
         try:
-            # 所有 Tab 建立 session
+            # 逐个 Tab 建立 session (避免同时 goto 触发 Akamai)
             print(f"\n[1] 建立浏览器 session ({concurrency} 个 Tab)...")
-            session_tasks = []
             for i, page in enumerate(pages):
-                session_tasks.append(
-                    page.goto(SEED_URL, wait_until="domcontentloaded", timeout=60000)
-                )
-            await asyncio.gather(*session_tasks)
-            await pages[0].wait_for_timeout(3000)
-            print("    ✓ 全部就绪")
+                await page.goto(SEED_URL, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(2000)
+                print(f"    Tab {i+1} ✓")
+            await pages[0].wait_for_timeout(1000)
+            print("    全部就绪")
 
             # 启动并发 worker
             print(f"\n[2] 开始获取价格...")
