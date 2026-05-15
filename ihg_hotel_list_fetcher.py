@@ -138,6 +138,9 @@ def save_results(hotels_list, csv_path):
 
     # SQLite
     try:
+        import sys
+        from pathlib import Path as _P
+        sys.path.insert(0, str(_P(__file__).parent))
         from ihg_db import IHGDatabase
         db = IHGDatabase()
         # 转换字段格式 (rating/review_count 转数值)

@@ -429,6 +429,9 @@ def get_db():
     """获取数据库实例"""
     global _db
     if _db is None:
+        import sys
+        from pathlib import Path as _P
+        sys.path.insert(0, str(_P(__file__).parent))
         from ihg_db import IHGDatabase
         _db = IHGDatabase()
     return _db
