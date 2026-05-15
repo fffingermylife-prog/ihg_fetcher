@@ -48,7 +48,7 @@ API_KEY = "se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y"
 POINTS_RATE_PLAN_CODES = ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"]
 
 WINDOW_SIZE_DAYS = 62
-REQUEST_DELAY_MS = (400, 900)  # 随机延迟区间 (毫秒)
+REQUEST_DELAY_MS = (200, 500)  # 随机延迟区间 (毫秒)
 MAX_RETRIES = 1
 
 # 数据目录
@@ -696,9 +696,9 @@ async def main():
             print(f"\n[1] 建立浏览器 session ({concurrency} 个 Tab)...")
             for i, page in enumerate(pages):
                 await page.goto(SEED_URL, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(random.randint(2000, 4000))
+                await page.wait_for_timeout(random.randint(1000, 2000))
                 print(f"    Tab {i+1} ✓")
-            await pages[0].wait_for_timeout(random.randint(1000, 2000))
+            await pages[0].wait_for_timeout(random.randint(500, 1000))
             print("    全部就绪")
 
             # 启动并发 worker
