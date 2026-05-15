@@ -375,8 +375,14 @@ async def main():
         })
 
     # 对比差异
-    print(f"\n[4] 对比变化...")
-    changes = compare_prices(old_prices, new_prices)
+    is_first_run = len(old_prices) == 0
+    if is_first_run:
+        print(f"\n[4] 首次运行, 无基线对比")
+        print(f"    获取到 {len(new_prices)} 天价格数据")
+        changes = []
+    else:
+        print(f"\n[4] 对比变化...")
+        changes = compare_prices(old_prices, new_prices)
 
     # 输出变化
     if changes:
