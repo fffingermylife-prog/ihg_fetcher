@@ -35,6 +35,7 @@ import asyncio
 import csv
 import json
 import random
+import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -56,6 +57,9 @@ DATA_DIR = "./ihg_data"
 
 # Seed URL
 SEED_URL = "https://www.ihg.com/hotels/us/en/find-hotels/hotel/rates"
+
+# 强制 stdout 实时输出 (解决 Windows 命令行缓冲问题)
+sys.stdout.reconfigure(line_buffering=True)
 
 
 # ============ 工具函数 ============
@@ -332,7 +336,7 @@ async def fetch_hotel_prices(page, hotel_code, windows):
 # ============ 对比逻辑 (含房态检测) ============
 
 def compare_prices(old_prices, new_prices):
-    """对比新旧价格, 返回变化列表 (含房态检测)"""
+    """对比新旧价格, 返回变化列表 (含房态检测, 使用含税价)"""
     old_map = {p["date"]: p for p in old_prices}
     new_map = {p["date"]: p for p in new_prices}
     changes = []
@@ -342,8 +346,9 @@ def compare_prices(old_prices, new_prices):
         old = old_map.get(d, {})
         new = new_map.get(d, {})
 
-        old_cash = old.get("cash_price")
-        new_cash = new.get("cash_price")
+        # 优先用含税价, 没有则用不含税价
+        old_cash = old.get("cash_price_after_tax") or old.get("cash_price")
+        new_cash = new.get("cash_price_after_tax") or new.get("cash_price")
         old_pts = old.get("points")
         new_pts = new.get("points")
 
@@ -351,7 +356,7 @@ def compare_prices(old_prices, new_prices):
         if not old and new:
             changes.append({
                 "date": d, "type": "新开放",
-                "cash_price": new_cash,
+                "cash_price": new.get("cash_price_after_tax") or new.get("cash_price"),
                 "cash_after_tax": new.get("cash_price_after_tax"),
                 "points": new_pts,
             })
