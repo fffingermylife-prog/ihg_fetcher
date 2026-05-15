@@ -34,6 +34,7 @@ import argparse
 import asyncio
 import csv
 import json
+import random
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -47,7 +48,7 @@ API_KEY = "se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y"
 POINTS_RATE_PLAN_CODES = ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"]
 
 WINDOW_SIZE_DAYS = 62
-REQUEST_DELAY_MS = 500
+REQUEST_DELAY_MS = (400, 900)  # 随机延迟区间 (毫秒)
 MAX_RETRIES = 1
 
 # 数据目录
@@ -292,13 +293,13 @@ async def fetch_hotel_prices(page, hotel_code, windows):
     for ws, we in windows:
         resp = await fetch_calendar(page, hotel_code, ws, we, points_mode=False)
         all_cash.extend(parse_cash(resp))
-        await page.wait_for_timeout(REQUEST_DELAY_MS)
+        await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
 
     # 获取积分价格
     for ws, we in windows:
         resp = await fetch_calendar(page, hotel_code, ws, we, points_mode=True)
         all_points.extend(parse_points(resp))
-        await page.wait_for_timeout(REQUEST_DELAY_MS)
+        await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
 
     # 合并
     cash_map = {c["date"]: c for c in all_cash}
@@ -465,14 +466,14 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run):
                 retries += 1
                 if retries <= MAX_RETRIES:
                     print(f"  [W{worker_id}] {hotel_code} 超时, 重试 ({retries}/{MAX_RETRIES})...")
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(random.randint(3000, 5000))
                 else:
                     print(f"  [W{worker_id}] {hotel_code} 超时, 跳过")
             except Exception as e:
                 retries += 1
                 if retries <= MAX_RETRIES:
                     print(f"  [W{worker_id}] {hotel_code} 失败, 重试 ({retries}/{MAX_RETRIES})...")
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(random.randint(2000, 4000))
                 else:
                     print(f"  [W{worker_id}] {hotel_code} 失败, 跳过: {str(e)[:100]}")
 
@@ -655,7 +656,7 @@ async def main():
     print(f"  模式: {mode_str} | 并发: {concurrency} Tab | 酒店: {len(hotel_codes)} 个")
     print(f"  日期: {windows[0][0]} ~ {windows[-1][1]} ({len(windows)} 个窗口)")
     print(f"  每酒店请求: 现金 {len(windows)} 次 + 积分 {len(windows)} 次")
-    est_time = len(hotel_codes) * len(windows) * 2 * (REQUEST_DELAY_MS / 1000) / concurrency
+    est_time = len(hotel_codes) * len(windows) * 2 * (sum(REQUEST_DELAY_MS) / 2 / 1000) / concurrency
     print(f"  预估耗时: ~{est_time:.0f}s ({est_time/60:.1f}min)")
     if args.dry_run:
         print(f"  [dry-run 模式, 不保存数据]")
@@ -695,9 +696,9 @@ async def main():
             print(f"\n[1] 建立浏览器 session ({concurrency} 个 Tab)...")
             for i, page in enumerate(pages):
                 await page.goto(SEED_URL, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(random.randint(2000, 4000))
                 print(f"    Tab {i+1} ✓")
-            await pages[0].wait_for_timeout(1000)
+            await pages[0].wait_for_timeout(random.randint(1000, 2000))
             print("    全部就绪")
 
             # 启动并发 worker
