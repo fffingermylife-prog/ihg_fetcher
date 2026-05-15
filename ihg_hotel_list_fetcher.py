@@ -108,7 +108,7 @@ def load_existing_hotels(csv_path):
 
 
 def save_results(hotels_list, csv_path):
-    """保存结果到 CSV 和 JSON"""
+    """保存结果到 CSV, JSON 和 SQLite"""
     # 排序: 先按国家, 再按评分从高到低
     def sort_key(h):
         country = h.get("country", "")
@@ -135,6 +135,40 @@ def save_results(hotels_list, csv_path):
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(hotels_list, f, indent=2, ensure_ascii=False)
     print(f"[+] JSON 已导出: {json_path}")
+
+    # SQLite
+    try:
+        from ihg_db import IHGDatabase
+        db = IHGDatabase()
+        # 转换字段格式 (rating/review_count 转数值)
+        db_hotels = []
+        for h in hotels_list:
+            rating = None
+            try:
+                rating = float(h.get("rating", ""))
+            except (ValueError, TypeError):
+                pass
+            review_count = None
+            try:
+                review_count = int(h.get("review_count", ""))
+            except (ValueError, TypeError):
+                pass
+            db_hotels.append({
+                "mnemonic": h.get("mnemonic", ""),
+                "name": h.get("name", ""),
+                "brand_code": h.get("brand_code", ""),
+                "city": h.get("city", ""),
+                "country": h.get("country", ""),
+                "address": h.get("address", ""),
+                "rating": rating,
+                "review_count": review_count,
+                "url": h.get("url", ""),
+            })
+        db.upsert_hotels(db_hotels)
+        db.close()
+        print(f"[+] SQLite 已更新: {db.db_path} ({len(db_hotels)} 个酒店)")
+    except Exception as e:
+        print(f"[!] SQLite 写入失败 (不影响 CSV/JSON): {e}")
 
 
 # ============ 页面操作 ============

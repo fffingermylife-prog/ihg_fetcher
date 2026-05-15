@@ -119,6 +119,15 @@ def load_hotel_codes(args):
         except Exception as e:
             print(f"[!] 读取 JSON 失败: {e}")
 
+    elif args.from_db:
+        try:
+            db = get_db()
+            codes = db.get_hotel_codes(args.country)
+            if not codes:
+                print(f"[!] 数据库中无酒店记录" + (f" (国家: {args.country})" if args.country else ""))
+        except Exception as e:
+            print(f"[!] 读取数据库失败: {e}")
+
     # 去重保序
     seen = set()
     unique = []
@@ -410,38 +419,31 @@ def compare_prices(old_prices, new_prices):
     return changes
 
 
-# ============ 存储函数 ============
+# ============ 存储函数 (SQLite) ============
+
+# 全局数据库实例 (在 main 中初始化)
+_db = None
+
+
+def get_db():
+    """获取数据库实例"""
+    global _db
+    if _db is None:
+        from ihg_db import IHGDatabase
+        _db = IHGDatabase()
+    return _db
+
 
 def load_baseline(hotel_code):
-    """加载基线数据"""
-    filepath = Path(DATA_DIR) / f"ihg_prices_{hotel_code}.json"
-    if filepath.exists():
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data.get("prices", []), data.get("fetch_date", "未知")
-        except Exception:
-            pass
-    return [], None
+    """从 SQLite 加载最近一次采集的价格作为基线"""
+    db = get_db()
+    return db.load_latest_prices(hotel_code)
 
 
 def save_prices(hotel_code, prices, days_queried):
-    """保存价格数据"""
-    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
-    filepath = Path(DATA_DIR) / f"ihg_prices_{hotel_code}.json"
-    result = {
-        "hotel_code": hotel_code,
-        "fetch_date": date.today().isoformat(),
-        "days_queried": days_queried,
-        "summary": {
-            "total_days": len(prices),
-            "has_cash": sum(1 for p in prices if p["cash_price"]),
-            "has_points": sum(1 for p in prices if p["points"]),
-        },
-        "prices": prices,
-    }
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
+    """保存价格数据到 SQLite"""
+    db = get_db()
+    db.save_prices(hotel_code, prices)
 
 
 # ============ 并发 Worker ============
@@ -625,6 +627,10 @@ async def main():
                         help="从 CSV 文件读取酒店代码 (需有 mnemonic 列)")
     parser.add_argument("--from-json", type=str, default=None,
                         help="从 JSON 文件读取酒店代码")
+    parser.add_argument("--from-db", action="store_true",
+                        help="从 SQLite 数据库读取酒店代码")
+    parser.add_argument("--country", type=str, default=None,
+                        help="配合 --from-db 按国家筛选酒店")
     parser.add_argument("--concurrency", type=int, default=2,
                         help="并发 Tab 数 (默认 2, 最大 3)")
     parser.add_argument("--incremental", action="store_true",
@@ -725,6 +731,10 @@ async def main():
 
     # 输出报告
     print_report(results)
+
+    # 关闭数据库
+    if _db:
+        _db.close()
 
 
 if __name__ == "__main__":
