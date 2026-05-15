@@ -37,7 +37,7 @@ POINTS_RATE_PLAN_CODES = ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"]
 
 # 滑动窗口 (和官网一致: 每次 2 个月)
 WINDOW_SIZE_DAYS = 62
-REQUEST_DELAY_MS = 2000
+REQUEST_DELAY_MS = 500
 
 # Seed URL (用于建立浏览器 session)
 SEED_URL = "https://www.ihg.com/hotels/us/en/find-hotels/hotel/rates"

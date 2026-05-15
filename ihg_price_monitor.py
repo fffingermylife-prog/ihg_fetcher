@@ -33,7 +33,7 @@ USER_DATA_DIR = "./ihg_browser_profile"
 API_KEY = "se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y"
 POINTS_RATE_PLAN_CODES = ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"]
 WINDOW_SIZE_DAYS = 62
-REQUEST_DELAY_MS = 2000
+REQUEST_DELAY_MS = 500
 
 
 # ============ 工具函数 (复用 ihg_test_calendar_price.py) ============
