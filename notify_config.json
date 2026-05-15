@@ -1,0 +1,16 @@
+{
+  "server_chan_key": "SCT350235TLGERB0nU0NYLf0DpqhyHDnDz",
+  "rules": {
+    "points_drop_pct": 40,
+    "cash_drop_pct": 40,
+    "new_date_below_avg_pct": 40,
+    "reopen_max_premium_pct": 20
+  },
+  "hotels": {
+    "DADHA": {"note": "岘港洲际"},
+    "HKGKL": {"note": "香港金域假日"},
+    "HKGKH": {"note": "香港旺角皇冠假日"},
+    "HKGIN": {"note": "香港英迪格"},
+    "PQCCP": {"note": "富国岛皇冠假日"}
+  }
+}

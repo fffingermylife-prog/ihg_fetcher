@@ -735,6 +735,13 @@ async def main():
     # 输出报告
     print_report(results)
 
+    # 发送通知 (如果有变动)
+    try:
+        from ihg_notify import notify_changes
+        notify_changes(results, get_db())
+    except Exception as e:
+        print(f"[通知] 发送失败: {e}")
+
     # 关闭数据库
     if _db:
         _db.close()
