@@ -288,22 +288,120 @@ def parse_points(response_data):
 
 # ============ 单酒店获取逻辑 ============
 
+async def fetch_calendar_batch(page, hotel_code, windows, points_mode=False):
+    """在浏览器内部并发请求多个窗口 (每个间隔几十毫秒错开)"""
+    payloads = []
+    for ws, we in windows:
+        if points_mode:
+            payloads.append({
+                "hotelMnemonics": [hotel_code],
+                "startDate": ws,
+                "endDate": we,
+                "lengthOfStay": 1,
+                "guestCounts": [{"otaCode": "AQC10", "count": 1}],
+                "options": {
+                    "includeSellStrategy": "followChannel",
+                    "returnAmountsAfterTaxForLowestOffer": True,
+                    "returnAverages": True,
+                    "lowestOfferPerRatePlan": True,
+                    "identifyLowestOfferPerRatePlan": True,
+                },
+                "rates": {"ratePlanCodes": POINTS_RATE_PLAN_CODES},
+            })
+        else:
+            payloads.append({
+                "hotelMnemonics": [hotel_code],
+                "startDate": ws,
+                "endDate": we,
+                "lengthOfStay": 1,
+                "guestCounts": [
+                    {"otaCode": "AQC10", "count": 1},
+                    {"otaCode": "AQC8", "count": 0},
+                ],
+                "options": {
+                    "identifyLowestOfferPerRatePlan": True,
+                    "returnAmountsAfterTaxForLowestOffer": True,
+                    "lowestOfferPerRatePlan": True,
+                    "returnAverages": True,
+                },
+            })
+
+    results = await page.evaluate("""
+    async ({ apiKey, payloads, staggerMs }) => {
+        const uuid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+            const r = Math.random() * 16 | 0;
+            const v = c === 'x' ? r : (r & 3 | 8);
+            return v.toString(16);
+        });
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+        const tasks = payloads.map(async (payload, i) => {
+            if (i > 0) await sleep(staggerMs[i - 1]);
+            try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 15000);
+                const resp = await fetch("https://apis.ihg.com/availability/v1/calendar", {
+                    method: "POST",
+                    headers: {
+                        "accept": "application/json, text/plain, */*",
+                        "content-type": "application/json; charset=UTF-8",
+                        "ihg-language": "en-US",
+                        "ihg-sessionid": uuid(),
+                        "ihg-transactionid": uuid(),
+                        "x-ihg-api-key": apiKey,
+                    },
+                    body: JSON.stringify(payload),
+                    credentials: "include",
+                    signal: controller.signal,
+                });
+                clearTimeout(timeout);
+                const text = await resp.text();
+                let json = null;
+                try { json = JSON.parse(text); } catch (e) {}
+                return { ok: resp.ok, data: json };
+            } catch (err) {
+                return { ok: false, error: err.message };
+            }
+        });
+
+        return await Promise.all(tasks);
+    }
+    """, {
+        "apiKey": API_KEY,
+        "payloads": payloads,
+        "staggerMs": [random.randint(50, 150) for _ in range(len(payloads) - 1)],
+    })
+
+    # 解析结果
+    parsed = []
+    for r in results:
+        if r.get("ok") and r.get("data"):
+            parsed.append(r["data"])
+        else:
+            parsed.append(None)
+    return parsed
+
+
 async def fetch_hotel_prices(page, hotel_code, windows):
-    """获取单个酒店的全部价格 (现金+积分), 返回合并后的列表"""
+    """获取单个酒店的全部价格 (现金+积分), 返回合并后的列表
+    
+    优化: 同类请求在浏览器内部并发 (每个错开50~150ms)
+    """
     all_cash = []
     all_points = []
 
-    # 获取现金价格
-    for ws, we in windows:
-        resp = await fetch_calendar(page, hotel_code, ws, we, points_mode=False)
+    # 现金请求: 浏览器内部并发
+    cash_results = await fetch_calendar_batch(page, hotel_code, windows, points_mode=False)
+    for resp in cash_results:
         all_cash.extend(parse_cash(resp))
-        await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
 
-    # 获取积分价格
-    for ws, we in windows:
-        resp = await fetch_calendar(page, hotel_code, ws, we, points_mode=True)
+    # 现金和积分之间稍微停一下
+    await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
+
+    # 积分请求: 浏览器内部并发
+    points_results = await fetch_calendar_batch(page, hotel_code, windows, points_mode=True)
+    for resp in points_results:
         all_points.extend(parse_points(resp))
-        await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
 
     # 合并
     cash_map = {c["date"]: c for c in all_cash}
