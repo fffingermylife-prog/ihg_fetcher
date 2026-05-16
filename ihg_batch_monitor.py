@@ -642,6 +642,8 @@ async def main():
                         help="全量模式查询天数 (默认 365)")
     parser.add_argument("--dry-run", action="store_true",
                         help="只显示变化, 不保存数据")
+    parser.add_argument("--proxy", type=str, default=None,
+                        help="代理地址 (如 http://127.0.0.1:7890)")
     args = parser.parse_args()
 
     # 限制并发数
@@ -674,6 +676,8 @@ async def main():
     print(f"  预估耗时: ~{est_time:.0f}s ({est_time/60:.1f}min)")
     if args.dry_run:
         print(f"  [dry-run 模式, 不保存数据]")
+    if args.proxy:
+        print(f"  代理: {args.proxy}")
     print("=" * 80)
 
     # 创建任务队列
@@ -686,14 +690,21 @@ async def main():
     Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as p:
+        # 构建启动参数
+        launch_opts = {
+            "headless": False,
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            "viewport": {"width": 1280, "height": 900},
+            "locale": "en-US",
+            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        }
+        if args.proxy:
+            launch_opts["proxy"] = {"server": args.proxy}
+
         context = await p.chromium.launch_persistent_context(
             USER_DATA_DIR,
-            headless=False,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 900},
-            locale="en-US",
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            **launch_opts,
         )
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
