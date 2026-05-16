@@ -2,29 +2,32 @@
 IHG 新日期开放时间探测脚本
 
 功能:
-    每隔 N 分钟检查一次指定酒店的最远可预订日期,
+    等待到指定时间后开始, 每隔随机 10~15 分钟检查一次指定酒店的最远可预订日期,
     记录"最远日期"何时从无价格变为有价格, 从而确定每日新日期开放的精确时间。
+    检测到新日期开放后自动停止。
 
 原理:
-    1. 获取当前最远可预订日期 (约 349 天后)
-    2. 每隔间隔时间重新请求, 检查最远日期是否变化
-    3. 当最远日期往后推了 1 天 → 记录此刻时间 = 新日期开放时间
-
-建议运行方式:
-    # 在预计开放时间前 1 小时开始跑 (如 6:30 开始)
-    python ihg_detect_open_time.py --code HKGKL --interval 5
-
-    # 跑 2~3 天, 确认规律后停止
+    1. 等待到指定启动时间 (默认 00:59)
+    2. 获取当前最远可预订日期 (约 349 天后) 作为基准
+    3. 每隔 10~15 分钟随机间隔请求, 检查最远日期是否变化
+    4. 当最远日期往后推了 1 天 → 记录此刻时间 = 新日期开放时间, 自动停止
 
 用法:
+    # 立即启动, 等待到 00:59 开始探测 (检测到新日期后停止)
     python ihg_detect_open_time.py --code HKGKL
-    python ihg_detect_open_time.py --code HKGKL --interval 5 --duration 180
+
+    # 自定义启动时间
+    python ihg_detect_open_time.py --code HKGKL --start-time 06:30
+
+    # 立即开始 (不等待)
+    python ihg_detect_open_time.py --code HKGKL --now
 """
 
 import argparse
 import asyncio
 import sys
 import random
+import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from playwright.async_api import async_playwright
@@ -128,23 +131,40 @@ async def main():
     parser = argparse.ArgumentParser(description="IHG 新日期开放时间探测")
     parser.add_argument("--code", type=str, default="HKGKL",
                         help="酒店代码 (默认 HKGKL)")
-    parser.add_argument("--interval", type=int, default=5,
-                        help="检查间隔 (分钟, 默认 5)")
-    parser.add_argument("--duration", type=int, default=180,
-                        help="最长运行时间 (分钟, 默认 180 = 3小时)")
+    parser.add_argument("--start-time", type=str, default="00:59",
+                        help="开始探测的时间 (HH:MM, 默认 00:59)")
+    parser.add_argument("--now", action="store_true",
+                        help="立即开始, 不等待指定时间")
     args = parser.parse_args()
 
     hotel_code = args.code.upper()
-    interval_min = args.interval
-    max_duration = args.duration
 
     print("=" * 60)
     print(f"  IHG 新日期开放时间探测")
     print(f"  酒店: {hotel_code}")
-    print(f"  间隔: 每 {interval_min} 分钟检查一次")
-    print(f"  最长: {max_duration} 分钟")
-    print(f"  开始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  间隔: 随机 10~15 分钟")
+    print(f"  启动时间: {'立即' if args.now else args.start_time}")
+    print(f"  停止条件: 检测到新日期开放后自动停止")
+    print(f"  当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
+
+    # 等待到指定时间
+    if not args.now:
+        target_hour, target_min = map(int, args.start_time.split(":"))
+        now = datetime.now()
+        target = now.replace(hour=target_hour, minute=target_min, second=0, microsecond=0)
+
+        # 如果目标时间已过, 等到明天的这个时间
+        if target <= now:
+            target += timedelta(days=1)
+
+        wait_seconds = (target - now).total_seconds()
+        print(f"\n  ⏰ 等待到 {target.strftime('%Y-%m-%d %H:%M')} 开始探测")
+        print(f"     还需等待 {wait_seconds/60:.0f} 分钟...")
+        print(f"     (脚本保持运行, 请勿关闭窗口)\n")
+
+        await asyncio.sleep(wait_seconds)
+        print(f"  ✓ 到达指定时间, 开始探测!\n")
 
     # 日志文件
     log_file = Path(f"ihg_open_time_{hotel_code}.log")
@@ -168,7 +188,7 @@ async def main():
 
         try:
             # 建立 session
-            print(f"\n[初始化] 建立浏览器 session...")
+            print(f"[初始化] 建立浏览器 session...")
             await page.goto(SEED_URL, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(3000)
             print(f"  ✓ Session 就绪")
@@ -190,18 +210,13 @@ async def main():
                 f.write(f"基准最远日期: {farthest}\n")
 
             # 循环探测
-            start_time = datetime.now()
             check_count = 0
 
             while True:
-                # 检查是否超时
-                elapsed = (datetime.now() - start_time).total_seconds() / 60
-                if elapsed >= max_duration:
-                    print(f"\n[结束] 已运行 {elapsed:.0f} 分钟, 达到最长时间, 退出")
-                    break
-
-                # 等待间隔
-                await page.wait_for_timeout(interval_min * 60 * 1000)
+                # 随机等待 10~15 分钟
+                wait_min = random.randint(10, 15)
+                wait_ms = wait_min * 60 * 1000
+                await page.wait_for_timeout(wait_ms)
                 check_count += 1
 
                 # 请求
@@ -213,13 +228,14 @@ async def main():
                     continue
 
                 if new_farthest > baseline_farthest:
-                    # 🎉 检测到新日期开放!
+                    # 🎉 检测到新日期开放! 停止探测
                     detect_time = datetime.now()
                     print(f"\n  {'='*50}")
                     print(f"  🎉 新日期开放!")
-                    print(f"  时间: {detect_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"  检测时间: {detect_time.strftime('%Y-%m-%d %H:%M:%S')}")
                     print(f"  之前最远: {baseline_farthest}")
                     print(f"  现在最远: {new_farthest} (积分: {new_points})")
+                    print(f"  检查次数: {check_count}")
                     print(f"  {'='*50}\n")
 
                     # 写日志
@@ -230,13 +246,13 @@ async def main():
                         f.write(f"  现在最远: {new_farthest} (积分: {new_points})\n")
                         f.write(f"  检查次数: {check_count}\n")
 
-                    # 更新基准, 继续监测 (确认是否每天同一时间)
-                    baseline_farthest = new_farthest
-                    print(f"  继续监测下一次开放...\n")
+                    # 自动停止
+                    print(f"  ✓ 探测完成, 自动退出")
+                    break
 
                 else:
                     # 无变化
-                    print(f"  [{now_str}] #{check_count} 最远: {new_farthest} (无变化)")
+                    print(f"  [{now_str}] #{check_count} 最远: {new_farthest} (无变化, 下次约{wait_min}分钟后)")
 
         except KeyboardInterrupt:
             print(f"\n[中断] 用户手动停止")
