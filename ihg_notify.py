@@ -184,13 +184,31 @@ def get_hotel_avg_cash(db, hotel_code):
     return sum(weekday_cash) / len(weekday_cash) if weekday_cash else None
 
 
+def get_hotel_display_name(hotel_code, db, config):
+    """获取酒店显示名称: 优先从数据库读取, 其次用配置备注, 最后用代码"""
+    # 1. 从数据库读取 (最准确)
+    hotel_info = db.get_hotel(hotel_code)
+    if hotel_info and hotel_info.get("name"):
+        name = hotel_info["name"]
+        country = hotel_info.get("country", "")
+        return f"{name} ({country})" if country else name
+
+    # 2. 从配置文件读备注
+    note = config.get("hotels", {}).get(hotel_code, {}).get("note", "")
+    if note:
+        return note
+
+    # 3. 只返回代码
+    return hotel_code
+
+
 def filter_alerts(changes_by_hotel, db, config):
     """从所有变动中筛选出需要通知的告警"""
     rules = config.get("rules", DEFAULT_RULES)
     alerts = []
 
     for hotel_code, changes in changes_by_hotel.items():
-        hotel_note = config.get("hotels", {}).get(hotel_code, {}).get("note", hotel_code)
+        hotel_note = get_hotel_display_name(hotel_code, db, config)
         avg_points = get_hotel_avg_points(db, hotel_code)
         avg_cash = get_hotel_avg_cash(db, hotel_code)
 
