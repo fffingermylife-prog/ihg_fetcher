@@ -38,6 +38,7 @@ import random
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 
@@ -83,7 +84,7 @@ class ClashProxyManager:
             raise RuntimeError("[Clash] 无法加载配置, 请检查 notify_config.json 中的 clash 字段")
 
         self.api_url = self.config["api_url"].rstrip("/")
-        self.secret = self.config["secret"]
+        self.secret = self._sanitize_secret(self.config["secret"])
         self.proxy_group = self.config["proxy_group"]
         self.rotate_every_n = self.config["rotate_every_n"]
         self.exclude_keywords = self.config["exclude_keywords"]
@@ -98,6 +99,36 @@ class ClashProxyManager:
         # 初始化: 获取可用节点列表
         self._refresh_nodes()
 
+    @staticmethod
+    def _sanitize_secret(raw):
+        """
+        清理 secret: 去除空白和中文引号, 校验是否为 ASCII
+        HTTP 头不允许非 ASCII 字符, 否则会触发 latin-1 编码错误
+        """
+        if not raw:
+            return ""
+        # 去除常见的中文引号和空白
+        cleaned = raw.strip().strip('"').strip("'")
+        # 中文引号 \u201c \u201d \u2018 \u2019
+        for ch in ('\u201c', '\u201d', '\u2018', '\u2019'):
+            cleaned = cleaned.strip(ch)
+        # 校验 ASCII
+        try:
+            cleaned.encode("ascii")
+        except UnicodeEncodeError:
+            print(f"[Clash] [警告] secret 包含非 ASCII 字符 (中文/emoji 等), 请检查 notify_config.json")
+            print(f"        如果 Clash 没设置 secret, 请把 \"secret\" 字段留空字符串: \"secret\": \"\"")
+            # 强行剔除非 ASCII 字符, 让程序不至于直接崩
+            cleaned = cleaned.encode("ascii", errors="ignore").decode("ascii")
+        return cleaned
+
+    def _build_proxy_url(self, group_name=None):
+        """构建 /proxies/<分组名> URL, 自动 URL 编码非 ASCII 字符"""
+        name = group_name if group_name is not None else self.proxy_group
+        # quote 默认会保留 / : 等, 用 safe="" 强制编码所有非 unreserved 字符
+        encoded = quote(name, safe="")
+        return f"{self.api_url}/proxies/{encoded}"
+
     def _headers(self):
         """构建请求头 (含 secret 认证)"""
         headers = {"Content-Type": "application/json"}
@@ -108,7 +139,7 @@ class ClashProxyManager:
     def _refresh_nodes(self):
         """从 Clash API 获取代理组信息, 刷新可用节点列表"""
         try:
-            url = f"{self.api_url}/proxies/{self.proxy_group}"
+            url = self._build_proxy_url()
             resp = requests.get(url, headers=self._headers(), timeout=5)
             resp.raise_for_status()
             data = resp.json()
@@ -116,14 +147,7 @@ class ClashProxyManager:
             all_nodes = data.get("all", [])
             self.current_node = data.get("now", "")
 
-            # 过滤: 排除信息节点和特殊节点
-            self.available_nodes = [
-                node for node in all_nodes
-                if not any(kw in node for kw in self.exclude_keywords)
-                and node != self.current_node  # 排除当前节点 (切换时选非当前的)
-            ]
-
-            # 其实应该保留全部可用节点, 只在选择时排除当前
+            # 过滤: 排除信息节点和特殊节点 (Traffic/Expire/分组节点等)
             self.available_nodes = [
                 node for node in all_nodes
                 if not any(kw in node for kw in self.exclude_keywords)
@@ -139,7 +163,7 @@ class ClashProxyManager:
     def _switch_to(self, node_name):
         """切换到指定节点"""
         try:
-            url = f"{self.api_url}/proxies/{self.proxy_group}"
+            url = self._build_proxy_url()
             resp = requests.put(
                 url,
                 headers=self._headers(),
