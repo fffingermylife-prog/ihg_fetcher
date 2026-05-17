@@ -248,39 +248,49 @@ class ClashProxyManager:
         except Exception:
             return False
 
-    def test_proxy_connectivity(self, proxy_url="http://127.0.0.1:7890", test_url="https://www.ihg.com", timeout=10):
+    def test_proxy_connectivity(self, proxy_url="http://127.0.0.1:7890", test_url=None, timeout=10):
         """
-        测试代理是否能正常连通目标网站
+        测试代理是否能正常连通外网
+        注意: 默认用 Cloudflare 的连通性检测 URL (返回204), 不用 IHG (会被 Akamai 反爬拦截)
         Args:
             proxy_url: 代理地址 (如 http://127.0.0.1:7890)
-            test_url: 测试连通性的目标 URL
+            test_url: 测试连通性的目标 URL, None 时用默认连通性检测 URL
             timeout: 超时时间 (秒)
         Returns:
             (bool, str) - (是否可用, 描述信息)
         """
-        try:
-            proxies = {"http": proxy_url, "https": proxy_url}
-            resp = requests.get(
-                test_url,
-                proxies=proxies,
-                timeout=timeout,
-                allow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/147.0.0.0"},
-            )
-            if resp.status_code < 400:
-                return True, f"HTTP {resp.status_code}, 响应时间 {resp.elapsed.total_seconds():.1f}s"
-            else:
-                return False, f"HTTP {resp.status_code}"
-        except requests.exceptions.ProxyError as e:
-            return False, f"代理连接失败: {str(e)[:80]}"
-        except requests.exceptions.ConnectTimeout:
-            return False, "代理连接超时"
-        except requests.exceptions.ReadTimeout:
-            return False, "代理读取超时"
-        except requests.exceptions.ConnectionError as e:
-            return False, f"连接错误: {str(e)[:80]}"
-        except Exception as e:
-            return False, f"未知错误: {str(e)[:80]}"
+        # 默认测试 URL: Cloudflare 连通性检测端点 (返回 HTTP 204), 主备两个
+        test_urls = [test_url] if test_url else [
+            "http://cp.cloudflare.com/generate_204",
+            "http://www.gstatic.com/generate_204",
+        ]
+
+        proxies = {"http": proxy_url, "https": proxy_url}
+        last_err = ""
+        for url in test_urls:
+            try:
+                resp = requests.get(
+                    url,
+                    proxies=proxies,
+                    timeout=timeout,
+                    allow_redirects=False,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/147.0.0.0"},
+                )
+                # 204 / 200 都算通
+                if resp.status_code in (200, 204):
+                    return True, f"HTTP {resp.status_code}, 响应时间 {resp.elapsed.total_seconds():.1f}s ({url})"
+                last_err = f"HTTP {resp.status_code} ({url})"
+            except requests.exceptions.ProxyError as e:
+                last_err = f"代理连接失败: {str(e)[:80]}"
+            except requests.exceptions.ConnectTimeout:
+                last_err = f"代理连接超时 ({url})"
+            except requests.exceptions.ReadTimeout:
+                last_err = f"代理读取超时 ({url})"
+            except requests.exceptions.ConnectionError as e:
+                last_err = f"连接错误: {str(e)[:80]}"
+            except Exception as e:
+                last_err = f"未知错误: {str(e)[:80]}"
+        return False, last_err
 
 
 # ============ 命令行测试 ============

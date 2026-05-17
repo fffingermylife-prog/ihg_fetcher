@@ -723,18 +723,24 @@ async def main():
                 # 有 Clash 管理器, 用它的方法
                 ok, msg = clash_mgr.test_proxy_connectivity(args.proxy)
             else:
-                # 没有 Clash 管理器, 手动测试
+                # 没有 Clash 管理器, 手动测试 (用通用连通性检测URL, 避免被反爬拦截)
                 import requests as _req
                 proxies = {"http": args.proxy, "https": args.proxy}
-                _resp = _req.get(
-                    "https://www.ihg.com",
-                    proxies=proxies,
-                    timeout=10,
-                    allow_redirects=True,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
-                ok = _resp.status_code < 400
-                msg = f"HTTP {_resp.status_code}, 响应时间 {_resp.elapsed.total_seconds():.1f}s"
+                ok, msg = False, ""
+                for _url in ["http://cp.cloudflare.com/generate_204",
+                             "http://www.gstatic.com/generate_204"]:
+                    try:
+                        _resp = _req.get(
+                            _url, proxies=proxies, timeout=10, allow_redirects=False,
+                            headers={"User-Agent": "Mozilla/5.0"},
+                        )
+                        if _resp.status_code in (200, 204):
+                            ok = True
+                            msg = f"HTTP {_resp.status_code}, 响应时间 {_resp.elapsed.total_seconds():.1f}s"
+                            break
+                        msg = f"HTTP {_resp.status_code}"
+                    except Exception as _e:
+                        msg = str(_e)[:100]
         except Exception as e:
             ok = False
             msg = str(e)[:100]
