@@ -483,16 +483,16 @@ def get_hotel_name(hotel_code):
     return name
 
 
-def format_hotel_label(hotel_code, max_name_len=20):
+def format_hotel_label(hotel_code, max_name_len=None):
     """格式化酒店标签: "CODE (名称)" 或仅 "CODE"
     Args:
         hotel_code: 酒店代码
-        max_name_len: 名称最大显示长度 (超过截断)
+        max_name_len: 名称最大显示长度 (默认 None 不截断, 传整数则截断超出部分)
     """
     name = get_hotel_name(hotel_code)
     if not name:
         return hotel_code
-    if len(name) > max_name_len:
+    if max_name_len is not None and len(name) > max_name_len:
         name = name[:max_name_len] + "..."
     return f"{hotel_code} ({name})"
 
@@ -553,7 +553,7 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run, clash_m
         elapsed = time.time() - t0
 
         if success and prices:
-            # 加载基线对比
+            # 加载基线对比 (old_date 是上次采集的时间, 用于在报告中说明对比基准)
             old_prices, old_date = load_baseline(hotel_code)
             changes = []
 
@@ -571,6 +571,7 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run, clash_m
                 "changes": changes,
                 "elapsed": elapsed,
                 "is_first_run": not bool(old_prices),
+                "baseline_date": old_date,  # 上次采集时间, 用于报告对比基准
             })
             status = "首次" if not old_prices else f"{len(changes)}变化"
             print(f"  [{idx}/{total_count}] {label} ✓ {elapsed:.1f}s ({len(prices)}天, {status})")
@@ -597,11 +598,16 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run, clash_m
 def print_report(results):
     """输出汇总变价报告"""
     all_changes = []
+    # 收集每个酒店的对比基准时间, 用于在报告中标注 "vs 上次 YYYY-MM-DD HH:MM"
+    baseline_by_hotel = {}
     for r in results:
-        if r["success"] and r["changes"]:
-            for c in r["changes"]:
-                c["hotel_code"] = r["hotel_code"]
-            all_changes.extend(r["changes"])
+        if r["success"]:
+            if r.get("baseline_date"):
+                baseline_by_hotel[r["hotel_code"]] = r["baseline_date"]
+            if r["changes"]:
+                for c in r["changes"]:
+                    c["hotel_code"] = r["hotel_code"]
+                all_changes.extend(r["changes"])
 
     if not all_changes:
         print(f"\n  ✓ 所有酒店无价格/房态变动")
@@ -616,7 +622,7 @@ def print_report(results):
         type_groups[t].append(c)
 
     print(f"\n{'='*80}")
-    print(f"  变动汇总报告")
+    print(f"  变动汇总报告 (对比基准: 各酒店上一次采集快照)")
     print(f"{'='*80}")
 
     # 优先显示重要变动
@@ -642,19 +648,13 @@ def print_report(results):
 
         for code, hotel_items in by_hotel.items():
             label = format_hotel_label(code)
-            if len(hotel_items) <= 3:
-                for item in hotel_items:
-                    detail = format_change_detail(item)
-                    print(f"    {label} {item['date']} {detail}")
-            else:
-                # 多天折叠显示
-                dates = [item["date"] for item in hotel_items]
-                print(f"    {label} {dates[0]}~{dates[-1]} ({len(hotel_items)}天)")
-                # 显示前 2 条
-                for item in hotel_items[:2]:
-                    detail = format_change_detail(item)
-                    print(f"      {item['date']} {detail}")
-                print(f"      ... 等 {len(hotel_items)-2} 条")
+            baseline = baseline_by_hotel.get(code, "")
+            baseline_hint = f"  [基准: {baseline}]" if baseline else ""
+            print(f"    {label}{baseline_hint}")
+            # 不再折叠, 全部展开显示
+            for item in hotel_items:
+                detail = format_change_detail(item)
+                print(f"      {item['date']} {detail}")
 
     # 剩余类型
     for change_type, items in type_groups.items():
