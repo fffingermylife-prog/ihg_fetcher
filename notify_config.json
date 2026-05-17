@@ -18,6 +18,10 @@
     "secret": "你的secret填这里",
     "proxy_group": "GLOBAL",
     "rotate_every_n": 5,
-    "exclude_keywords": ["Traffic", "Expire", "DIRECT", "REJECT", "GLOBAL", "Proxies", "节点选择", "自动选择", "故障转移", "负载均衡"]
+    "only_flag_emoji": true,
+    "exclude_keywords": [
+      "Traffic", "Expire", "DIRECT", "REJECT",
+      "GLOBAL", "Proxies", "节点选择", "自动选择", "故障转移", "负载均衡", "Final"
+    ]
   }
 }

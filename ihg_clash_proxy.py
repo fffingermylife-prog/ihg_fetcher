@@ -62,10 +62,23 @@ def load_clash_config():
             "exclude_keywords": clash_cfg.get("exclude_keywords", [
                 "Traffic", "Expire", "DIRECT", "REJECT"
             ]),
+            # 仅保留以国旗 emoji 开头的节点 (排除所有应用分组/大区分组)
+            "only_flag_emoji": clash_cfg.get("only_flag_emoji", False),
         }
     except Exception as e:
         print(f"[Clash] 配置加载失败: {e}")
         return None
+
+
+def _starts_with_flag_emoji(name):
+    """判断名称是否以国旗 emoji 开头 (regional indicator symbols)
+    国旗由两个 regional indicator 字符组成, Unicode 范围 U+1F1E6 ~ U+1F1FF
+    """
+    if not name or len(name) < 2:
+        return False
+    c0 = ord(name[0])
+    c1 = ord(name[1])
+    return 0x1F1E6 <= c0 <= 0x1F1FF and 0x1F1E6 <= c1 <= 0x1F1FF
 
 
 # ============ 核心类 ============
@@ -88,6 +101,7 @@ class ClashProxyManager:
         self.proxy_group = self.config["proxy_group"]
         self.rotate_every_n = self.config["rotate_every_n"]
         self.exclude_keywords = self.config["exclude_keywords"]
+        self.only_flag_emoji = self.config.get("only_flag_emoji", False)
 
         # 状态
         self.available_nodes = []    # 可用节点列表
@@ -147,11 +161,16 @@ class ClashProxyManager:
             all_nodes = data.get("all", [])
             self.current_node = data.get("now", "")
 
-            # 过滤: 排除信息节点和特殊节点 (Traffic/Expire/分组节点等)
-            self.available_nodes = [
-                node for node in all_nodes
-                if not any(kw in node for kw in self.exclude_keywords)
-            ]
+            # 过滤策略:
+            # - only_flag_emoji=True: 只保留以国旗 emoji 开头的节点 (最严格, 推荐)
+            # - 否则: 用关键词排除 (Traffic/Expire/分组节点等)
+            if self.only_flag_emoji:
+                self.available_nodes = [n for n in all_nodes if _starts_with_flag_emoji(n)]
+            else:
+                self.available_nodes = [
+                    node for node in all_nodes
+                    if not any(kw in node for kw in self.exclude_keywords)
+                ]
 
         except requests.exceptions.ConnectionError:
             print(f"[Clash] 无法连接 Clash API ({self.api_url}), 请确认 Clash 已运行")
