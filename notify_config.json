@@ -12,5 +12,12 @@
     "HKGKH": {"note": "香港旺角皇冠假日"},
     "HKGIN": {"note": "香港英迪格"},
     "PQCCP": {"note": "富国岛皇冠假日"}
+  },
+  "clash": {
+    "api_url": "http://127.0.0.1:56285",
+    "secret": "你的secret填这里",
+    "proxy_group": "Proxies",
+    "rotate_every_n": 5,
+    "exclude_keywords": ["Traffic", "Expire", "DIRECT", "REJECT"]
   }
 }

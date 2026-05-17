@@ -451,7 +451,7 @@ def save_prices(hotel_code, prices, days_queried):
 
 # ============ 并发 Worker ============
 
-async def worker(worker_id, page, task_queue, results, windows, dry_run):
+async def worker(worker_id, page, task_queue, results, windows, dry_run, clash_mgr=None):
     """并发 worker: 从队列取酒店代码, 获取价格, 对比变化"""
     while True:
         try:
@@ -511,6 +511,10 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run):
             })
             status = "首次" if not old_prices else f"{len(changes)}变化"
             print(f"  [{idx}/{total_count}] {hotel_code} ✓ {elapsed:.1f}s ({len(prices)}天, {status})")
+
+            # Clash: 每完成一个酒店, 检查是否需要轮换节点
+            if clash_mgr:
+                clash_mgr.on_hotel_done()
         else:
             results.append({
                 "hotel_code": hotel_code,
@@ -519,6 +523,10 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run):
                 "changes": [],
             })
             print(f"  [{idx}/{total_count}] {hotel_code} ✗ {elapsed:.1f}s (失败)")
+
+            # Clash: 失败时立即切换节点
+            if clash_mgr:
+                clash_mgr.on_failure()
 
 
 # ============ 报告输出 ============
@@ -644,6 +652,8 @@ async def main():
                         help="只显示变化, 不保存数据")
     parser.add_argument("--proxy", type=str, default=None,
                         help="代理地址 (如 http://127.0.0.1:7890)")
+    parser.add_argument("--auto-switch", action="store_true",
+                        help="启用 Clash 自动切换节点 (需配置 notify_config.json 中 clash 字段)")
     args = parser.parse_args()
 
     # 限制并发数
@@ -654,6 +664,29 @@ async def main():
     if not hotel_codes:
         print("[!] 未指定酒店代码, 请使用 --codes, --from-csv 或 --from-json")
         return
+
+    # 初始化 Clash 自动切换 (如果启用)
+    clash_mgr = None
+    if args.auto_switch:
+        try:
+            from ihg_clash_proxy import ClashProxyManager
+            clash_mgr = ClashProxyManager()
+            if clash_mgr.is_available():
+                print(f"[Clash] ✓ 已连接, 当前节点: {clash_mgr.current_node}")
+                print(f"[Clash]   可用节点: {len(clash_mgr.available_nodes)} 个, 每 {clash_mgr.rotate_every_n} 个酒店轮换")
+                # 启动时先随机切换一次
+                clash_mgr.rotate()
+            else:
+                print("[Clash] ✗ 无法连接 Clash API, 将不使用自动切换")
+                clash_mgr = None
+        except Exception as e:
+            print(f"[Clash] 初始化失败: {e}, 将不使用自动切换")
+            clash_mgr = None
+
+        # 如果启用了 auto-switch 但没指定 --proxy, 自动设为 Clash 本地代理
+        if clash_mgr and not args.proxy:
+            args.proxy = "http://127.0.0.1:7890"
+            print(f"[Clash] 自动设置代理: {args.proxy}")
 
     # 确定日期窗口
     start = date.today() + timedelta(days=1)
@@ -678,7 +711,58 @@ async def main():
         print(f"  [dry-run 模式, 不保存数据]")
     if args.proxy:
         print(f"  代理: {args.proxy}")
+    if clash_mgr:
+        print(f"  Clash自动切换: ✓ (每{clash_mgr.rotate_every_n}个酒店轮换)")
     print("=" * 80)
+
+    # 启动前检测: 代理连通性验证
+    if args.proxy:
+        print(f"\n[0] 检测代理连通性...")
+        try:
+            if clash_mgr:
+                # 有 Clash 管理器, 用它的方法
+                ok, msg = clash_mgr.test_proxy_connectivity(args.proxy)
+            else:
+                # 没有 Clash 管理器, 手动测试
+                import requests as _req
+                proxies = {"http": args.proxy, "https": args.proxy}
+                _resp = _req.get(
+                    "https://www.ihg.com",
+                    proxies=proxies,
+                    timeout=10,
+                    allow_redirects=True,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                ok = _resp.status_code < 400
+                msg = f"HTTP {_resp.status_code}, 响应时间 {_resp.elapsed.total_seconds():.1f}s"
+        except Exception as e:
+            ok = False
+            msg = str(e)[:100]
+
+        if ok:
+            print(f"    代理可用 ✓ ({msg})")
+        else:
+            print(f"    代理不可用 ✗ ({msg})")
+            print(f"[!] 代理 {args.proxy} 无法连通 IHG, 请检查:")
+            print(f"    1. Clash 是否正在运行")
+            print(f"    2. 代理端口是否正确")
+            print(f"    3. 当前节点是否可用")
+            if clash_mgr:
+                # 尝试切换节点再试一次
+                print(f"[Clash] 尝试切换节点后重试...")
+                clash_mgr.rotate()
+                import time as _t
+                _t.sleep(2)
+                ok2, msg2 = clash_mgr.test_proxy_connectivity(args.proxy)
+                if ok2:
+                    print(f"    切换后可用 ✓ ({msg2})")
+                else:
+                    print(f"    切换后仍不可用 ✗ ({msg2})")
+                    print(f"[!] 退出. 请确认 Clash 代理正常后重新运行.")
+                    return
+            else:
+                print(f"[!] 退出. 请确认代理正常后重新运行.")
+                return
 
     # 创建任务队列
     task_queue = asyncio.Queue()
@@ -733,7 +817,7 @@ async def main():
             worker_tasks = []
             for i, page in enumerate(pages):
                 worker_tasks.append(
-                    worker(i + 1, page, task_queue, results, windows, args.dry_run)
+                    worker(i + 1, page, task_queue, results, windows, args.dry_run, clash_mgr)
                 )
             await asyncio.gather(*worker_tasks)
 
