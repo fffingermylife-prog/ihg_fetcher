@@ -345,11 +345,17 @@ async def fetch_hotel_prices(page, hotel_code, windows):
 # ============ 对比逻辑 (含房态检测) ============
 
 def compare_prices(old_prices, new_prices):
-    """对比新旧价格, 返回变化列表 (含房态检测, 使用含税价)"""
+    """对比新旧价格, 返回变化列表 (含房态检测, 使用含税价)
+    注: 自动过滤过期日期 (今天及之前), 只关心未来的价格变动
+    """
     old_map = {p["date"]: p for p in old_prices}
     new_map = {p["date"]: p for p in new_prices}
     changes = []
     all_dates = sorted(set(old_map.keys()) | set(new_map.keys()))
+
+    # 过滤过期日期: 只保留 > 今天的日期 (今天和过去都没意义)
+    today_str = date.today().isoformat()
+    all_dates = [d for d in all_dates if d > today_str]
 
     for d in all_dates:
         old = old_map.get(d, {})
@@ -437,6 +443,60 @@ def get_db():
     return _db
 
 
+# 酒店名缓存 (避免每次都查 db)
+_hotel_name_cache = {}
+
+
+def get_hotel_name(hotel_code):
+    """获取酒店名称 (优先 notify_config.json 的 note 备注, 然后是 db 里的 name)
+    返回值: 酒店名称, 找不到则返回空字符串
+    """
+    if hotel_code in _hotel_name_cache:
+        return _hotel_name_cache[hotel_code]
+
+    name = ""
+    # 1) 优先用 notify_config.json 里的 note (用户自己起的中文别名)
+    try:
+        import json as _json
+        from pathlib import Path as _P
+        cfg_path = _P(__file__).parent / "notify_config.json"
+        if cfg_path.exists():
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+            note = cfg.get("hotels", {}).get(hotel_code, {}).get("note", "")
+            if note:
+                name = note
+    except Exception:
+        pass
+
+    # 2) 再用数据库里的 name
+    if not name:
+        try:
+            db = get_db()
+            hotel = db.get_hotel(hotel_code)
+            if hotel and hotel.get("name"):
+                name = hotel["name"]
+        except Exception:
+            pass
+
+    _hotel_name_cache[hotel_code] = name
+    return name
+
+
+def format_hotel_label(hotel_code, max_name_len=20):
+    """格式化酒店标签: "CODE (名称)" 或仅 "CODE"
+    Args:
+        hotel_code: 酒店代码
+        max_name_len: 名称最大显示长度 (超过截断)
+    """
+    name = get_hotel_name(hotel_code)
+    if not name:
+        return hotel_code
+    if len(name) > max_name_len:
+        name = name[:max_name_len] + "..."
+    return f"{hotel_code} ({name})"
+
+
 def load_baseline(hotel_code):
     """从 SQLite 加载最近一次采集的价格作为基线"""
     db = get_db()
@@ -459,6 +519,9 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run, clash_m
         except asyncio.QueueEmpty:
             break
 
+        # 酒店带名称的显示标签 (如 "HKGKL (香港金域假日)")
+        label = format_hotel_label(hotel_code)
+
         t0 = time.time()
         success = False
         retries = 0
@@ -475,17 +538,17 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run, clash_m
             except asyncio.TimeoutError:
                 retries += 1
                 if retries <= MAX_RETRIES:
-                    print(f"  [W{worker_id}] {hotel_code} 超时, 重试 ({retries}/{MAX_RETRIES})...")
+                    print(f"  [W{worker_id}] {label} 超时, 重试 ({retries}/{MAX_RETRIES})...")
                     await page.wait_for_timeout(random.randint(3000, 5000))
                 else:
-                    print(f"  [W{worker_id}] {hotel_code} 超时, 跳过")
+                    print(f"  [W{worker_id}] {label} 超时, 跳过")
             except Exception as e:
                 retries += 1
                 if retries <= MAX_RETRIES:
-                    print(f"  [W{worker_id}] {hotel_code} 失败, 重试 ({retries}/{MAX_RETRIES})...")
+                    print(f"  [W{worker_id}] {label} 失败, 重试 ({retries}/{MAX_RETRIES})...")
                     await page.wait_for_timeout(random.randint(2000, 4000))
                 else:
-                    print(f"  [W{worker_id}] {hotel_code} 失败, 跳过: {str(e)[:100]}")
+                    print(f"  [W{worker_id}] {label} 失败, 跳过: {str(e)[:100]}")
 
         elapsed = time.time() - t0
 
@@ -510,7 +573,7 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run, clash_m
                 "is_first_run": not bool(old_prices),
             })
             status = "首次" if not old_prices else f"{len(changes)}变化"
-            print(f"  [{idx}/{total_count}] {hotel_code} ✓ {elapsed:.1f}s ({len(prices)}天, {status})")
+            print(f"  [{idx}/{total_count}] {label} ✓ {elapsed:.1f}s ({len(prices)}天, {status})")
 
             # Clash: 每完成一个酒店, 检查是否需要轮换节点
             if clash_mgr:
@@ -522,7 +585,7 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run, clash_m
                 "elapsed": elapsed,
                 "changes": [],
             })
-            print(f"  [{idx}/{total_count}] {hotel_code} ✗ {elapsed:.1f}s (失败)")
+            print(f"  [{idx}/{total_count}] {label} ✗ {elapsed:.1f}s (失败)")
 
             # Clash: 失败时立即切换节点
             if clash_mgr:
@@ -578,14 +641,15 @@ def print_report(results):
             by_hotel[code].append(item)
 
         for code, hotel_items in by_hotel.items():
+            label = format_hotel_label(code)
             if len(hotel_items) <= 3:
                 for item in hotel_items:
                     detail = format_change_detail(item)
-                    print(f"    {code} {item['date']} {detail}")
+                    print(f"    {label} {item['date']} {detail}")
             else:
                 # 多天折叠显示
                 dates = [item["date"] for item in hotel_items]
-                print(f"    {code} {dates[0]}~{dates[-1]} ({len(hotel_items)}天)")
+                print(f"    {label} {dates[0]}~{dates[-1]} ({len(hotel_items)}天)")
                 # 显示前 2 条
                 for item in hotel_items[:2]:
                     detail = format_change_detail(item)
