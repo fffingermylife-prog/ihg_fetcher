@@ -595,8 +595,35 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run, clash_m
 
 # ============ 报告输出 ============
 
+# 日志目录 (每次运行一个详情文件)
+LOG_DIR = Path(__file__).parent / "ihg_logs"
+
+# 优先级顺序 (重要变动放前面)
+PRIORITY_ORDER = [
+    "积分房售罄", "积分房重新开放", "新开放",
+    "现金售罄", "现金重新开放",
+    "积分降", "积分涨", "现金降", "现金涨",
+]
+
+# 类型简写 (用于命令行精简显示)
+TYPE_SHORT = {
+    "积分房售罄": "积售罄",
+    "积分房重新开放": "积开放",
+    "现金售罄": "现售罄",
+    "现金重新开放": "现开放",
+    "新开放": "新开放",
+    "积分降": "积降",
+    "积分涨": "积涨",
+    "现金降": "现降",
+    "现金涨": "现涨",
+}
+
+
 def print_report(results):
-    """输出汇总变价报告"""
+    """输出汇总变价报告
+    - 命令行: 精简显示 (每酒店一行汇总, 不展开日期)
+    - 日志文件: 完整详情 (按类型分组 + 每个日期变动 + 对比基准时间)
+    """
     all_changes = []
     # 收集每个酒店的对比基准时间, 用于在报告中标注 "vs 上次 YYYY-MM-DD HH:MM"
     baseline_by_hotel = {}
@@ -609,66 +636,159 @@ def print_report(results):
                     c["hotel_code"] = r["hotel_code"]
                 all_changes.extend(r["changes"])
 
+    # 写日志文件 (无论是否有变动都写, 方便回溯)
+    log_path = _write_detail_log(results, all_changes, baseline_by_hotel)
+
     if not all_changes:
         print(f"\n  ✓ 所有酒店无价格/房态变动")
+        if log_path:
+            print(f"  详细日志: {log_path}")
         return
 
-    # 按类型分组
-    type_groups = {}
-    for c in all_changes:
-        t = c["type"]
-        if t not in type_groups:
-            type_groups[t] = []
-        type_groups[t].append(c)
-
+    # ===== 命令行: 精简显示 =====
     print(f"\n{'='*80}")
-    print(f"  变动汇总报告 (对比基准: 各酒店上一次采集快照)")
+    print(f"  变动汇总 (对比基准: 各酒店上一次采集快照)")
     print(f"{'='*80}")
 
-    # 优先显示重要变动
-    priority_order = [
-        "积分房售罄", "积分房重新开放", "新开放",
-        "现金售罄", "现金重新开放",
-        "积分降", "积分涨", "现金降", "现金涨",
-    ]
+    # 按酒店聚合: hotel_code -> {type: count}
+    hotel_summary = {}
+    for c in all_changes:
+        code = c["hotel_code"]
+        t = c["type"]
+        if code not in hotel_summary:
+            hotel_summary[code] = {}
+        hotel_summary[code][t] = hotel_summary[code].get(t, 0) + 1
 
-    for change_type in priority_order:
-        items = type_groups.pop(change_type, [])
-        if not items:
-            continue
+    # 排序: 有更重要变动 (积分房售罄/重新开放/新开放) 的酒店排前
+    def hotel_priority(code):
+        types = hotel_summary[code]
+        # 用最高优先级类型作为主排序键
+        for i, t in enumerate(PRIORITY_ORDER):
+            if t in types:
+                return (i, -sum(types.values()))  # 同优先级, 变动多的排前
+        return (99, 0)
 
-        print(f"\n  [{change_type}] {len(items)} 条:")
-        # 按酒店分组显示
-        by_hotel = {}
-        for item in items:
-            code = item["hotel_code"]
-            if code not in by_hotel:
-                by_hotel[code] = []
-            by_hotel[code].append(item)
+    sorted_codes = sorted(hotel_summary.keys(), key=hotel_priority)
 
-        for code, hotel_items in by_hotel.items():
-            label = format_hotel_label(code)
-            baseline = baseline_by_hotel.get(code, "")
-            baseline_hint = f"  [基准: {baseline}]" if baseline else ""
-            print(f"    {label}{baseline_hint}")
-            # 不再折叠, 全部展开显示
-            for item in hotel_items:
-                detail = format_change_detail(item)
-                print(f"      {item['date']} {detail}")
+    for code in sorted_codes:
+        label = format_hotel_label(code)
+        types = hotel_summary[code]
+        # 按 PRIORITY_ORDER 顺序拼出 "5积降, 3积售罄" 这样的简短统计
+        parts = []
+        for t in PRIORITY_ORDER:
+            if t in types:
+                parts.append(f"{types[t]}{TYPE_SHORT.get(t, t)}")
+        # 剩余类型
+        for t, n in types.items():
+            if t not in PRIORITY_ORDER:
+                parts.append(f"{n}{t}")
+        summary_str = ", ".join(parts)
+        print(f"  {label}: {summary_str}")
 
-    # 剩余类型
-    for change_type, items in type_groups.items():
-        if items:
-            print(f"\n  [{change_type}] {len(items)} 条")
-
-    # 汇总统计
+    # 命令行底部统计 + 日志路径
     print(f"\n{'='*80}")
     success_count = sum(1 for r in results if r["success"])
     fail_count = sum(1 for r in results if not r["success"])
     first_run = sum(1 for r in results if r.get("is_first_run"))
     total_changes = len(all_changes)
     print(f"  统计: 成功 {success_count} | 失败 {fail_count} | 首次运行 {first_run} | 总变动 {total_changes}")
+    if log_path:
+        print(f"  详细日志: {log_path}")
     print(f"{'='*80}")
+
+
+def _write_detail_log(results, all_changes, baseline_by_hotel):
+    """写完整详情到日志文件, 返回文件路径; 失败返回 None"""
+    try:
+        from datetime import datetime
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = LOG_DIR / f"monitor_{ts}.log"
+
+        lines = []
+        lines.append("=" * 80)
+        lines.append(f"  IHG 价格监控详细日志")
+        lines.append(f"  生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"  对比基准: 各酒店上一次采集快照")
+        lines.append("=" * 80)
+
+        # 顶部统计
+        success_count = sum(1 for r in results if r["success"])
+        fail_count = sum(1 for r in results if not r["success"])
+        first_run = sum(1 for r in results if r.get("is_first_run"))
+        lines.append(f"\n  统计: 成功 {success_count} | 失败 {fail_count} | 首次运行 {first_run} | 总变动 {len(all_changes)}\n")
+
+        # 失败列表
+        failed = [r for r in results if not r["success"]]
+        if failed:
+            lines.append("─" * 80)
+            lines.append(f"  失败酒店 ({len(failed)} 个):")
+            lines.append("─" * 80)
+            for r in failed:
+                lines.append(f"  {format_hotel_label(r['hotel_code'])} (耗时 {r['elapsed']:.1f}s)")
+            lines.append("")
+
+        if not all_changes:
+            lines.append("\n  ✓ 所有酒店无价格/房态变动\n")
+        else:
+            # 按类型分组展示完整详情
+            type_groups = {}
+            for c in all_changes:
+                type_groups.setdefault(c["type"], []).append(c)
+
+            lines.append("─" * 80)
+            lines.append(f"  变动详情 (按类型分组)")
+            lines.append("─" * 80)
+
+            seen_types = set()
+            for change_type in PRIORITY_ORDER:
+                items = type_groups.get(change_type, [])
+                if not items:
+                    continue
+                seen_types.add(change_type)
+                lines.append(f"\n[{change_type}] {len(items)} 条:")
+
+                # 按酒店再分组
+                by_hotel = {}
+                for item in items:
+                    by_hotel.setdefault(item["hotel_code"], []).append(item)
+
+                for code, hotel_items in by_hotel.items():
+                    label = format_hotel_label(code)
+                    baseline = baseline_by_hotel.get(code, "")
+                    baseline_hint = f"  [基准: {baseline}]" if baseline else ""
+                    lines.append(f"  {label}{baseline_hint}")
+                    for item in hotel_items:
+                        detail = format_change_detail(item)
+                        lines.append(f"    {item['date']} {detail}")
+
+            # 剩余类型
+            for change_type, items in type_groups.items():
+                if change_type in seen_types:
+                    continue
+                lines.append(f"\n[{change_type}] {len(items)} 条:")
+                by_hotel = {}
+                for item in items:
+                    by_hotel.setdefault(item["hotel_code"], []).append(item)
+                for code, hotel_items in by_hotel.items():
+                    label = format_hotel_label(code)
+                    baseline = baseline_by_hotel.get(code, "")
+                    baseline_hint = f"  [基准: {baseline}]" if baseline else ""
+                    lines.append(f"  {label}{baseline_hint}")
+                    for item in hotel_items:
+                        detail = format_change_detail(item)
+                        lines.append(f"    {item['date']} {detail}")
+
+        lines.append("\n" + "=" * 80)
+        lines.append(f"  日志结束")
+        lines.append("=" * 80)
+
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        return log_path
+    except Exception as e:
+        print(f"[!] 写日志失败: {e}")
+        return None
 
 
 def format_change_detail(item):
