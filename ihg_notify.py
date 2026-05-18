@@ -39,10 +39,12 @@ CONFIG_PATH = Path(__file__).parent / "notify_config.json"
 
 # 默认规则
 DEFAULT_RULES = {
-    "points_drop_pct": 40,       # 积分降幅 ≥ 40% 通知
-    "cash_drop_pct": 40,         # 现金降幅 ≥ 40% 通知
-    "new_date_below_avg_pct": 40,  # 新日期 ≤ 历史均价×0.6 (即低于40%)
-    "reopen_max_premium_pct": 20,  # 重新开放积分 ≤ 平日均价×1.2 (溢价不超过20%)
+    "points_drop_pct": 40,         # 积分降幅 ≥ 40% 通知
+    "cash_drop_pct": 40,           # 现金降幅 ≥ 40% 通知
+    "new_date_below_avg_pct": 30,  # 新日期 ≤ 历史均价×0.7 (即低于30%)
+    "reopen_max_ratio": 0.9,       # 节假日重新开放积分 ≤ 平日均价×0.9 (即至少低 10%)
+    # 旧字段兼容: 若未提供 reopen_max_ratio, 用 reopen_max_premium_pct (正数=允许溢价百分比)
+    "reopen_max_premium_pct": -10,
 }
 
 
@@ -219,9 +221,17 @@ def filter_alerts(changes_by_hotel, db, config):
             if c["type"] == "积分房重新开放":
                 new_pts = c.get("new_value")
                 if new_pts and is_holiday(c["date"]):
-                    # 积分 ≤ 平日均价×1.2
-                    max_premium = rules.get("reopen_max_premium_pct", 20)
-                    if avg_points is None or new_pts <= avg_points * (1 + max_premium / 100):
+                    # 优先用 reopen_max_ratio (更直观), 否则换算 reopen_max_premium_pct
+                    if "reopen_max_ratio" in rules:
+                        max_ratio = rules["reopen_max_ratio"]
+                    else:
+                        max_premium = rules.get("reopen_max_premium_pct", -10)
+                        max_ratio = 1 + max_premium / 100
+                    if avg_points is None or new_pts <= avg_points * max_ratio:
+                        ratio_hint = (
+                            f"≤均价×{max_ratio:.2f}={avg_points*max_ratio:.0f}"
+                            if avg_points else "无均价基准"
+                        )
                         alert = {
                             "level": "🔴",
                             "type": "积分房重新开放(节假日)",
@@ -229,7 +239,7 @@ def filter_alerts(changes_by_hotel, db, config):
                             "note": hotel_note,
                             "date": c["date"],
                             "holiday": get_holiday_name(c["date"]),
-                            "detail": f"积分{new_pts}" + (f" (平日均价{avg_points:.0f})" if avg_points else ""),
+                            "detail": f"积分{new_pts}" + (f" (平日均价{avg_points:.0f}, {ratio_hint})" if avg_points else ""),
                         }
 
             # 🟠 积分降价 ≥ 40%

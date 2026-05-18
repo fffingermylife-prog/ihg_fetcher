@@ -3,8 +3,8 @@
   "rules": {
     "points_drop_pct": 40,
     "cash_drop_pct": 40,
-    "new_date_below_avg_pct": 40,
-    "reopen_max_premium_pct": 20
+    "new_date_below_avg_pct": 30,
+    "reopen_max_ratio": 0.9
   },
   "hotels": {
     "DADHA": {"note": "岘港洲际"},
