@@ -1,7 +1,7 @@
 # IHG 酒店价格监控项目 - 会话总结
 
 ## 项目目标
-分析 IHG（洲际酒店集团）网站，获取旗下酒店的日历现金最低价和积分兑换价格，计算积分性价比(CPP)，监控价格变动，降价/房态变化时自动推送微信通知。
+分析 IHG（洲际酒店集团）网站，获取旗下酒店的日历现金最低价和积分兑换价格，计算积分性价比(CPP)，监控价格变动，降价/房态变化时自动推送微信通知，通知里附带可点击的预订链接。
 
 ---
 
@@ -14,7 +14,7 @@
 - 增量去重：已有 CSV 数据自动跳过
 - 输出字段：mnemonic, name, brand_code, city, country, address, rating, review_count, url
 - 结果按国家分组 + 评分排序
-- **同时写入 SQLite 数据库**
+- 同时写入 SQLite 数据库
 
 ### 2. 多酒店批量监控 (`ihg_batch_monitor.py`)
 - 多 Tab 并发 (默认 2, 最大 3)
@@ -23,10 +23,16 @@
 - 房态检测: 售罄/重新开放/积分房售罄/价格涨降
 - 失败自动重试 + 超时跳过
 - 随机请求间隔 (200~500ms) 降低被检测风险
-- **支持 Clash 代理** (`--proxy http://127.0.0.1:7890`)
-- **SQLite 存储** (保留所有历史记录)
-- **自动触发微信通知** (满足告警条件时)
 - 支持从 `--codes` / `--from-csv` / `--from-json` / `--from-db` 读取酒店列表
+- **支持 Clash 代理** (`--proxy http://127.0.0.1:7890`)
+- **支持 Clash 自动切换节点** (`--auto-switch`)
+- **启动前代理连通性检测** (用 Cloudflare 204 端点)
+- **过期日期过滤** (compare_prices 自动跳过今天及之前的日期)
+- **酒店中文名显示** (优先 notify_config.json 的 note，其次 db 的 name)
+- **命令行精简显示**: 每酒店一行汇总（如 `5积售罄, 3积降, 2现降`）
+- **详细日志写文件**: `./ihg_logs/monitor_YYYYMMDD_HHMMSS.log`，含完整变动 + 对比基准日期
+- SQLite 存储 (保留所有历史记录)
+- 自动触发微信通知 (满足告警条件时)
 
 ### 3. SQLite 数据库 (`ihg_db.py`)
 - `hotels` 表: 酒店基本信息 (从 hotel_list_fetcher 写入)
@@ -36,23 +42,37 @@
 
 ### 4. 价格告警通知 (`ihg_notify.py`)
 - Server酱微信推送
-- 4级告警规则:
-  - 🔴 积分房重新开放 (中国节假日 + 价格合理)
-  - 🟠 积分降价 ≥ 40%
-  - 🟡 现金降价 ≥ 40%
-  - 🟢 新日期低价 (≤ 历史均价×0.6)
+- 4级告警规则（**已收紧阈值**）:
+  - 🔴 积分房重新开放: 节假日 + 价格 ≤ 平日均价×0.9 (`reopen_max_ratio: 0.9`)
+  - 🟠 积分降价: 降幅 ≥ 40%
+  - 🟡 现金降价: 降幅 ≥ 40%
+  - 🟢 新日期低价: 价格 ≤ 历史均价×0.7 (`new_date_below_avg_pct: 30`)
 - 中国节假日识别 2026~2027 (含前后2天缓冲)
-- 平日均价计算 (排除节假日+周末)
+- 平日均价计算 = **周一~周四 + 非节假日 + 当天有价格**（排除周末和节假日避免拉高均价）
 - 酒店名从数据库自动读取
 - 配置文件: `notify_config.json`
+- **每条告警自动附 IHG 官网 H5 预订链接** (酒店名+日期参数都已预填)
+- 新增 CLI: `python ihg_notify.py --url HKGKL:2026-10-01[:nights]` 快速生成单个链接
+- ⚠️ **预订链接 URL 格式待验证**：当前用 `https://www.ihg.com/hotels/cn/zh/find-hotels/hotel/rooms?qSlH=...` 用户测试反馈 page not found；下次会话需要找到正确路径
 
-### 5. 新日期开放时间探测 (`ihg_detect_open_time.py`)
+### 5. Clash 代理自动切换 (`ihg_clash_proxy.py`) ✨ 新增
+- 通过 Clash RESTful API 自动切换节点
+- 定期轮换：每处理 N 个酒店随机切换节点（默认 5）
+- 失败切换：请求失败/超时时立即切换
+- **only_flag_emoji 模式**: 只保留以国旗 emoji 开头的节点（U+1F1E6 ~ U+1F1FF），自动排除应用分组 (YouTube/Disney/Final/HK/JP 等)
+- **secret 自动清理**: 剔除非 ASCII 字符（避免 latin-1 编码错误），中文引号去除
+- **URL 编码分组名**: 用 `urllib.parse.quote` 处理 emoji/中文分组名
+- 启动前测试代理连通性（用 `cp.cloudflare.com/generate_204`，**不能用 IHG 测**因为会被 Akamai 反爬拦截返回 403）
+- 独立运行: `--test` / `--list` / `--current` / `--switch` / `--rotate`
+- 配置在 `notify_config.json` 的 `clash` 字段
+
+### 6. 新日期开放时间探测 (`ihg_detect_open_time.py`)
 - 定时启动 (默认 00:59, 支持 `--start-time` 自定义)
 - 每 10~15 分钟随机间隔检查最远可预订日期
 - 检测到新日期开放后自动停止
 - 日志保存到 `ihg_open_time_<CODE>.log`
 
-### 6. 旧版工具 (保留)
+### 7. 旧版工具 (保留)
 - `ihg_price_monitor.py` - 单酒店价格监控 (被 batch_monitor 替代)
 - `ihg_test_calendar_price.py` - 单酒店全年价格获取
 - `ihg_debug_calendar.py` - Calendar API 调试
@@ -63,9 +83,13 @@
 
 | 项目 | 详情 |
 |------|------|
-| API Key | `se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y` |
-| Calendar API | POST `https://apis.ihg.com/availability/v1/calendar` |
+| API Key (国际版) | `se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y` |
+| API Key (中国小程序) | `HAX1XvhTaXfK1TwYp2LeMEwv8kJCgClV` (在 `apis.ihg.com.cn` 上) |
+| Calendar API (用) | POST `https://apis.ihg.com/availability/v1/calendar` |
+| 中国版 V3 接口 (未用) | POST `https://apis.ihg.com.cn/availability/v3/hotels/offers` 需 openId/unionCode/微信登录态 |
+| IHG 微信小程序 AppID | `wx255b58f0992b3c53` |
 | 反爬 | 必须用 Playwright 有头浏览器（Akamai 拦截无头模式） |
+| 反爬 (extra) | requests 直接访问 `www.ihg.com` 会被反爬返回 403，用 Cloudflare 204 端点测代理 |
 | 现金 payload | `guestCounts`: AQC10+AQC8, 无 `includeSellStrategy`, 无 `rates` |
 | 积分 payload | `guestCounts`: 只有 AQC10, 有 `includeSellStrategy: "followChannel"`, 有 `rates.ratePlanCodes` |
 | 积分 codes | `["IVAN1","IVAN3","IVAN5","IVAN6","IVAN7","IVANI"]` |
@@ -79,6 +103,30 @@
 | 不含税价格 | `lowestRate.totalAmount` 或 `offers[refId].totalAmount` |
 | 浏览器内并发 | 同一 page 的 6 个 fetch 并发会被 Akamai 限流，**不可行** |
 | Clash 代理 | 通过 `--proxy http://127.0.0.1:7890` 走 Clash，已验证可用 |
+| Clash for Windows API | external-controller 端口在客户端 Settings 中查看（不是 config.yaml 里的） |
+
+---
+
+## 微信通知跳转方案探索（重要）
+
+本次会话深入研究了「微信通知点击跳转到 IHG 预订页」的可行性，最终决策走 HTTP 链接路线：
+
+### ❌ 微信小程序短链方案（已放弃）
+- 用户分享 IHG 小程序得到的链接 `#小程序://IHG优悦会/8uGVbV2paEN91at` **能直接跳到指定酒店和日期**
+- 但**短链是 IHG 在分享时一次性生成的**，第三方无法批量生成
+- 每个"酒店+日期"组合都需要手动分享一次
+- 节假日日期固定，可手动收集 20+ 个，但维护成本高且跨年要重新做
+
+### ❌ 自建小程序跳 IHG 方案（已放弃）
+- `wx.navigateToMiniProgram(appId='wx255b58f0992b3c53')` 技术上可行
+- 但需要 IHG 在自己 app.json 里加白名单或微信开放平台互跳授权
+- 个人小程序大概率没有授权，且微信审核会卡
+
+### ✅ HTTP 链接方案（当前路线）
+- 通知里附 `https://www.ihg.com/.../find-hotels/hotel/rooms?qSlH=HKGKL&qCiD=1&qCiMy=102026...`
+- 用户在微信里点击 → 内置浏览器打开 → IHG H5 预订页（预填酒店+日期）
+- ⚠️ **当前问题**: 测试 `cn/zh` 路径返回 `page not found`，需要找到 IHG 中文/英文的正确预订路径
+- 通过 web_search 看到 IHG 真实路径形如 `https://www.ihg.com/holidayinn/hotels/us/en/hong-kong/hkgkl/hoteldetail`，但**这是酒店详情页不是预订页**，需要进一步抓包国际版网站的真实预订 URL
 
 ---
 
@@ -93,18 +141,21 @@
 | 3 Tab 同时建立 session 卡死 | Akamai 检测同时导航 | 逐个 Tab 建立, 错开 1~2 秒 |
 | Windows 命令行输出卡住 | Python stdout 缓冲 | `sys.stdout.reconfigure(line_buffering=True)` |
 | 浏览器内 6 请求并发卡死 | Akamai 限流同 session 并发 | 回退为串行请求 |
-| `No module named 'ihg_db'` | 从其他目录运行时找不到模块 | `sys.path.insert(0, Path(__file__).parent)` |
-| CSV 编码读取失败 | 旧文件用其他编码保存 | 删除旧文件重新生成 |
+| Clash secret 含中文导致 latin-1 错误 | HTTP 头不允许非 ASCII | `_sanitize_secret` 自动剔除非 ASCII 字符 |
+| Clash 切换节点不生效 | 用户在 Global 模式但代码切的是 Proxies 组 | 改成切 GLOBAL 组 + 加 only_flag_emoji 过滤 |
+| 代理连通性测试 IHG 返回 403 | Akamai 反爬拦截 requests | 改用 Cloudflare 204 端点 (cp.cloudflare.com/generate_204) |
+| 报告含 2027-05-16 售罄(已过期) | compare_prices 没过滤过期日期 | 加 `today_str` 过滤 `[d for d in all_dates if d > today_str]` |
 
 ---
 
 ## 仓库文件结构
 
 ```
-fffingermylife-prog/test (分支: feat/ihg-calendar-price)
-├── ihg_batch_monitor.py         # 核心: 多酒店批量价格监控 + 通知
+fffingermylife-prog/ihg_fetcher (分支: feat/ihg-calendar-price)
+├── ihg_batch_monitor.py         # 核心: 多酒店批量价格监控 + 通知 + 日志
 ├── ihg_hotel_list_fetcher.py    # 正式版: 按国家抓取酒店列表
-├── ihg_notify.py                # 通知模块: Server酱微信推送
+├── ihg_notify.py                # 通知模块: Server酱推送 + 预订链接生成
+├── ihg_clash_proxy.py           # ✨ Clash 代理节点自动切换
 ├── ihg_db.py                    # 数据库封装: SQLite 读写
 ├── ihg_detect_open_time.py      # 工具: 新日期开放时间探测
 ├── ihg_test_calendar_price.py   # 测试: 单酒店全年价格获取
@@ -116,7 +167,8 @@ fffingermylife-prog/test (分支: feat/ihg-calendar-price)
 ├── ihg_calendar_browser.js      # 浏览器 Console 版
 ├── ihg_diagnostic.js            # API 诊断工具
 ├── ihg_extract_cookie.js        # Cookie 提取助手
-├── notify_config.json           # 通知配置 (Server酱 key + 规则)
+├── notify_config.json           # 通知配置 (Server酱 key + 规则 + clash 配置)
+├── .gitignore                   # ✨ 忽略 ihg_data/ ihg_logs/ ihg_browser_profile/
 ├── requirements.txt             # playwright, requests
 ├── README.md                    # 使用文档
 └── PROJECT_CONTEXT.md           # 本文件
@@ -124,38 +176,67 @@ fffingermylife-prog/test (分支: feat/ihg-calendar-price)
 
 ---
 
+## notify_config.json 结构
+
+```json
+{
+  "server_chan_key": "SCT...",
+  "rules": {
+    "points_drop_pct": 40,
+    "cash_drop_pct": 40,
+    "new_date_below_avg_pct": 30,    // 新日期 ≤ 均价×0.7
+    "reopen_max_ratio": 0.9          // 节假日重新开放 ≤ 均价×0.9
+  },
+  "hotels": {
+    "DADHA": {"note": "岘港洲际"},
+    "HKGKL": {"note": "香港金域假日"}
+  },
+  "clash": {
+    "api_url": "http://127.0.0.1:64821",   // Clash for Windows Settings 里的实际端口
+    "secret": "secret",
+    "proxy_group": "GLOBAL",
+    "rotate_every_n": 5,
+    "only_flag_emoji": true,
+    "exclude_keywords": ["Traffic","Expire","DIRECT","REJECT","GLOBAL","Proxies","Final"]
+  }
+}
+```
+
+---
+
 ## 使用示例
 
 ```bash
-# 1. 抓取越南酒店列表 (同时写入 SQLite)
+# 1. 抓取越南酒店列表
 python ihg_hotel_list_fetcher.py --target "Vietnam Hotels"
 
-# 2. 批量监控 (直连)
-python ihg_batch_monitor.py --codes DADHA,HKGKL,HKGKH,HKGIN --concurrency 3
+# 2. 批量监控 (Clash 自动切换节点) ← 推荐
+python ihg_batch_monitor.py --codes DADHA,HKGKL --auto-switch
 
-# 3. 批量监控 (走 Clash 代理)
-python ihg_batch_monitor.py --codes DADHA,HKGKL --proxy http://127.0.0.1:7890
+# 3. 批量监控 (直连)
+python ihg_batch_monitor.py --codes DADHA,HKGKL --concurrency 3
 
 # 4. 从数据库读取酒店, 增量模式
 python ihg_batch_monitor.py --from-db --incremental
 
 # 5. 按国家监控
-python ihg_batch_monitor.py --from-db --country "Vietnam" --proxy http://127.0.0.1:7890
+python ihg_batch_monitor.py --from-db --country "Vietnam" --auto-switch
 
 # 6. 查看数据库统计
 python ihg_db.py --stats
 
-# 7. 查看某酒店某天价格历史
-python ihg_db.py --history HKGKL:2026-10-01
+# 7. 测试 Clash 连接 + 列出节点
+python ihg_clash_proxy.py --test
+python ihg_clash_proxy.py --list
 
-# 8. 测试微信通知
+# 8. 测试微信通知 (含示例预订链接)
 python ihg_notify.py --test
 
-# 9. 探测新日期开放时间 (00:59 自动开始)
-python ihg_detect_open_time.py --code HKGKL
+# 9. 生成单个预订链接 (调试用)
+python ihg_notify.py --url HKGKL:2026-10-01:2
 
-# 10. 查看节假日表
-python ihg_notify.py --holidays
+# 10. 探测新日期开放时间
+python ihg_detect_open_time.py --code HKGKL
 ```
 
 ---
@@ -164,44 +245,60 @@ python ihg_notify.py --holidays
 
 ```
 07:35  增量模式 (检测新日期开放)
-       python ihg_batch_monitor.py --from-db --incremental
+       python ihg_batch_monitor.py --from-db --incremental --auto-switch
 
 08:30  全量模式 (重点酒店, 完整对比)
-       python ihg_batch_monitor.py --codes 重点酒店 --days 365
+       python ihg_batch_monitor.py --codes 重点酒店 --days 365 --auto-switch
 
-14:00  全量模式 (其余酒店前半, 走代理)
-       python ihg_batch_monitor.py --from-db --days 180 --proxy http://127.0.0.1:7890
+14:00  全量模式 (其余酒店前半)
+       python ihg_batch_monitor.py --from-db --days 180 --auto-switch
 
-20:00  全量模式 (其余酒店后半, 走代理)
-       python ihg_batch_monitor.py --from-db --days 180 --proxy http://127.0.0.1:7890
+20:00  全量模式 (其余酒店后半)
+       python ihg_batch_monitor.py --from-db --days 180 --auto-switch
 ```
 
 ---
 
 ## 下一步计划
 
-### 优先级 1: Clash 进阶 (自动切换节点)
-- 通过 Clash RESTful API 每批酒店自动切换代理节点
-- 降低单 IP 被限流的风险
-- 支持 200+ 酒店大规模监控
+### 🔥 优先级 1: 修复预订链接 URL 格式
+**当前问题**: `https://www.ihg.com/hotels/cn/zh/find-hotels/hotel/rooms?qSlH=...` 返回 `page not found`
+
+**待办**:
+- 用户用电脑浏览器在 IHG 中文/英文官网搜一家酒店选好日期后，把**最终房型选择页**的完整 URL 抓出来
+- 对照 `ihg_notify.py` 的 `build_booking_url()` 修正 URL 格式
+- 可能正确的路径不是 `find-hotels/hotel/rooms`，而是其他（比如 brand 子路径 `holidayinn/hotels/us/en/.../hoteldetail`）
+- 也可以参考 IHG 国际版搜索 URL：站内 `/hotels/<country>/<lang>/find-hotels/hotel-search?qSlH=HKGKL...`
+- 验证成功的 URL 格式后，更新 `BOOKING_URL_LANG` 默认值，确保中英文都能用
 
 ### 优先级 2: 数据分析输出
 - CPP 排行榜：哪些酒店积分性价比最高
-- 价格趋势图
+- 价格趋势图（每日采集后基于历史 SQLite 数据）
 - 最佳预订时机建议
+- 节假日期间的"金价位"日期推荐
 
 ### 优先级 3: 确认新日期开放精确时间
 - 运行 `ihg_detect_open_time.py` 连续 2~3 天
 - 确认后调整定时任务时间
 
+### 优先级 4: 监控规模化
+- 200+ 酒店级别的稳定运行测试
+- 失败重试和断点续跑机制
+- 监控仪表板（可视化最近一次结果 + 历史趋势）
+
 ---
 
 ## 给新会话的提示
-- GitHub 仓库: `fffingermylife-prog/test`，分支 `feat/ihg-calendar-price`
-- 用户环境: Windows + Python 3.12 + Playwright + Clash 代理 (端口 7890)
+- GitHub 仓库: `fffingermylife-prog/ihg_fetcher`，分支 `feat/ihg-calendar-price`
+- 用户环境: Windows + Python 3.12 + Playwright + Clash for Windows (Global 模式)
 - 用户偏好: 中文沟通，代码注释用中文，喜欢简洁实用的方案
+- 用户的 5 家关注酒店: DADHA(岘港洲际), HKGKL(香港金域假日), HKGKH(香港旺角皇冠假日), HKGIN(香港英迪格), PQCCP(富国岛皇冠假日)
 - 关键：不要猜测 IHG 的 URL/API 结构，所有参数都基于已验证的真实抓包
 - Calendar API payload 现金和积分**不同**，不能共用同一个 payload
 - API 返回的日期是合并区间（start~end），必须展开为逐天
 - 浏览器内并发 fetch 会被 Akamai 限流，必须串行请求
+- requests 直接访问 `www.ihg.com` 会被反爬返回 403，所以代理连通性测试用 Cloudflare 204 端点
 - Server酱 SendKey 已配置在 notify_config.json 中
+- Clash for Windows API 端口在客户端 Settings 里查看实际值（每次启动可能变），**不是** config.yaml 里写的端口
+- `notify_config.json` 的 `clash.proxy_group` 必须和用户实际使用的模式匹配（Global → "GLOBAL"，Rule → 实际生效的分组名）
+- 微信小程序跳转方案已放弃（无法程序生成），现在走 IHG 官网 H5 链接路线，但 URL 格式还需验证
