@@ -25,6 +25,7 @@ import json
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import urlencode
 
 try:
     import requests
@@ -46,6 +47,10 @@ DEFAULT_RULES = {
     # 旧字段兼容: 若未提供 reopen_max_ratio, 用 reopen_max_premium_pct (正数=允许溢价百分比)
     "reopen_max_premium_pct": -10,
 }
+
+# IHG 官网 H5 预订链接配置 (微信内置浏览器可打开)
+BOOKING_URL_LANG = "zh"     # "zh" = 中文版 (cn/zh), "en" = 英文版 (us/en)
+BOOKING_DEFAULT_NIGHTS = 1  # 默认入住天数
 
 
 # ============ 中国节假日 2026~2027 ============
@@ -109,6 +114,66 @@ def is_weekday(date_str):
     """判断是否是工作日 (周一到周四)"""
     d = date.fromisoformat(date_str)
     return d.weekday() < 4  # 0=周一, 4=周五
+
+
+# ============ 预订链接生成 ============
+
+def build_booking_url(hotel_code, check_in_date, nights=None, lang=None):
+    """
+    生成 IHG 官网 H5 预订链接 (微信内置浏览器可直接打开)
+
+    Args:
+        hotel_code: 酒店代码 (如 HKGKL)
+        check_in_date: 入住日期 字符串 (YYYY-MM-DD) 或 date 对象
+        nights: 入住天数, 默认 1
+        lang: "zh" 中文版 或 "en" 英文版, 默认读全局配置
+
+    Returns:
+        完整 URL 字符串
+
+    URL 参数说明:
+        qSlH    酒店代码
+        qCiD    入住日 (1~31)
+        qCiMy   入住月年 (MMYYYY 格式, 如 102026 = 2026年10月)
+        qCoD    退房日
+        qCoMy   退房月年
+        qAdlt   成人数
+        qChld   儿童数
+        qRms    房间数
+
+    示例:
+        build_booking_url("HKGKL", "2026-10-01")
+        → https://www.ihg.com/hotels/cn/zh/find-hotels/hotel/rooms?qSlH=HKGKL&qCiD=1&qCiMy=102026&qCoD=2&qCoMy=102026&qAdlt=1&qChld=0&qRms=1
+    """
+    if isinstance(check_in_date, str):
+        check_in = date.fromisoformat(check_in_date)
+    else:
+        check_in = check_in_date
+
+    if nights is None:
+        nights = BOOKING_DEFAULT_NIGHTS
+    check_out = check_in + timedelta(days=nights)
+
+    if lang is None:
+        lang = BOOKING_URL_LANG
+
+    # 中文版 vs 英文版路径
+    if lang == "zh":
+        base = "https://www.ihg.com/hotels/cn/zh/find-hotels/hotel/rooms"
+    else:
+        base = "https://www.ihg.com/hotels/us/en/find-hotels/hotel/rooms"
+
+    params = {
+        "qSlH": hotel_code,
+        "qCiD": check_in.day,
+        "qCiMy": f"{check_in.month:02d}{check_in.year}",
+        "qCoD": check_out.day,
+        "qCoMy": f"{check_out.month:02d}{check_out.year}",
+        "qAdlt": 1,
+        "qChld": 0,
+        "qRms": 1,
+    }
+    return f"{base}?{urlencode(params)}"
 
 
 # ============ 配置加载 ============
@@ -338,8 +403,10 @@ def format_message(alerts):
 
         for a in items:
             holiday_tag = f" 🎉{a['holiday']}" if a.get("holiday") else ""
-            lines.append(f"- **{a['note']}** `{a['date']}`{holiday_tag}")
+            booking_url = build_booking_url(a["hotel"], a["date"])
+            lines.append(f"- [**{a['note']}**]({booking_url}) `{a['date']}`{holiday_tag}")
             lines.append(f"  {a['detail']}")
+            lines.append(f"  [👉 立即预订]({booking_url})")
 
     lines.append(f"\n---\n*监控时间: {date.today().isoformat()}*")
 
@@ -419,6 +486,7 @@ def notify_changes(results, db):
     print(f"{'='*60}")
     for a in alerts:
         print(f"  {a['level']} [{a['note']}] {a['date']} {a['detail']}")
+        print(f"      🔗 {build_booking_url(a['hotel'], a['date'])}")
     print(f"{'='*60}")
 
     # 发送 Server酱
@@ -435,6 +503,10 @@ if __name__ == "__main__":
     parser.add_argument("--init", action="store_true", help="生成默认配置文件")
     parser.add_argument("--test", action="store_true", help="发送测试通知")
     parser.add_argument("--holidays", action="store_true", help="显示节假日列表")
+    parser.add_argument("--url", type=str, default=None,
+                        help="生成 IHG 预订链接, 格式: HKGKL:2026-10-01 或 HKGKL:2026-10-01:2 (酒店:日期[:入住天数])")
+    parser.add_argument("--lang", type=str, default=None, choices=["zh", "en"],
+                        help="--url 时指定语言版 (zh 中文 / en 英文)")
     args = parser.parse_args()
 
     if args.init:
@@ -449,8 +521,18 @@ if __name__ == "__main__":
             print(f"  2. 填入 server_chan_key")
             print(f"  如果配置文件不存在, 运行: python ihg_notify.py --init")
         else:
+            sample_url_zh = build_booking_url("HKGKL", "2026-10-01")
+            sample_url_en = build_booking_url("HKGKL", "2026-10-01", lang="en")
             title = "IHG 通知测试"
-            body = "## 测试成功\n\n如果你看到这条消息, 说明 Server酱 配置正确。\n\n🔴 积分房重新开放\n🟠 积分大幅降价\n🟡 现金大幅降价\n🟢 新日期高性价比"
+            body = (
+                "## 测试成功\n\n"
+                "如果你看到这条消息, 说明 Server酱 配置正确。\n\n"
+                "🔴 积分房重新开放\n🟠 积分大幅降价\n🟡 现金大幅降价\n🟢 新日期高性价比\n\n"
+                "---\n"
+                "**预订链接示例** (点击应能在微信内置浏览器打开):\n\n"
+                f"- 中文版: [HKGKL 2026-10-01]({sample_url_zh})\n"
+                f"- 英文版: [HKGKL 2026-10-01]({sample_url_en})\n"
+            )
             send_server_chan(title, body, send_key)
 
     elif args.holidays:
@@ -468,6 +550,18 @@ if __name__ == "__main__":
             print(f"\n  {month}:")
             for d in dates:
                 print(f"    {d}")
+
+    elif args.url:
+        # 解析格式 HKGKL:2026-10-01 或 HKGKL:2026-10-01:2
+        parts = args.url.split(":")
+        if len(parts) < 2:
+            print("[!] 格式错误, 应为: HKGKL:2026-10-01 或 HKGKL:2026-10-01:2")
+            sys.exit(1)
+        code = parts[0].strip().upper()
+        check_in = parts[1].strip()
+        nights = int(parts[2]) if len(parts) >= 3 else None
+        url = build_booking_url(code, check_in, nights=nights, lang=args.lang)
+        print(url)
 
     else:
         parser.print_help()
