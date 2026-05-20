@@ -109,6 +109,7 @@ class ClashProxyManager:
         self.hotel_count = 0         # 已处理酒店计数
         self.switch_count = 0        # 切换次数统计
         self.fail_count = 0          # 连续失败计数
+        self._switch_generation = 0  # 切换代数: 每次切换 +1, worker 用此判断是否需要刷新
 
         # 初始化: 获取可用节点列表
         self._refresh_nodes()
@@ -180,7 +181,11 @@ class ClashProxyManager:
             self.available_nodes = []
 
     def _switch_to(self, node_name):
-        """切换到指定节点, 同时切换所有相关代理组确保生效"""
+        """切换到指定节点, 同时切换所有相关代理组确保生效
+        
+        注意: 切换后需要调用方主动刷新浏览器页面 (navigate) 来断开旧 TCP 连接,
+        否则 Playwright 的持久连接会继续走旧节点。详见 on_switch_callback。
+        """
         try:
             old = self.current_node
 
@@ -213,10 +218,11 @@ class ClashProxyManager:
             self.current_node = node_name
             self.switch_count += 1
             self.fail_count = 0  # 重置连续失败计数
+            self._switch_generation += 1  # 代数+1, 所有 worker 下次循环会感知到并刷新页面
             print(f"[Clash] 切换节点: {old} → {node_name} (第{self.switch_count}次)")
 
-            # 3. 等待切换生效 (让已有连接断开/新连接走新节点)
-            time.sleep(1.5)
+            # 3. 短暂等待 Clash 内部路由更新
+            time.sleep(0.5)
             return True
         except Exception as e:
             print(f"[Clash] 切换异常: {e}")
@@ -238,6 +244,27 @@ class ClashProxyManager:
         return random.choice(candidates)
 
     # ============ 公开接口 ============
+
+    def needs_reconnect(self, worker_generation):
+        """检查该 worker 是否需要刷新浏览器连接
+        
+        基于代数计数器机制: 每次切换节点 _switch_generation +1,
+        每个 worker 各自记录已同步的代数, 不相等则说明有新切换需要刷新。
+        
+        Playwright 浏览器通过代理建立的 TCP 连接是持久的 (HTTP/2 Keep-Alive),
+        Clash 切换节点只影响新连接, 已有连接仍走旧节点。
+        所以切换后必须让浏览器重新导航 (navigate) 来强制断开旧连接、建立新连接。
+        
+        Args:
+            worker_generation: 该 worker 上次同步时的代数
+        Returns: True 需要刷新, False 不需要
+        """
+        return worker_generation < self._switch_generation
+
+    @property
+    def generation(self):
+        """获取当前切换代数, worker 用此记录自己已同步到哪一代"""
+        return self._switch_generation
 
     def rotate(self):
         """

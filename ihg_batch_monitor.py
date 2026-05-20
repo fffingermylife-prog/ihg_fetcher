@@ -513,11 +513,28 @@ def save_prices(hotel_code, prices, days_queried):
 
 async def worker(worker_id, page, task_queue, results, windows, dry_run, clash_mgr=None):
     """并发 worker: 从队列取酒店代码, 获取价格, 对比变化"""
+    # 每个 worker 记录自己已同步到的 Clash 切换代数
+    my_generation = clash_mgr.generation if clash_mgr else 0
+
     while True:
         try:
             idx, hotel_code, total_count = task_queue.get_nowait()
         except asyncio.QueueEmpty:
             break
+
+        # Clash: 如果切换了节点 (代数变了), 需要刷新页面断开旧 TCP 连接
+        # 原理: Playwright 浏览器到 Clash 代理的 TCP 连接是持久的 (Keep-Alive),
+        #        Clash 切节点只对新连接生效, 旧连接仍走原节点。
+        #        通过 page.goto() 重新导航, 浏览器会关闭旧连接池、建立新连接。
+        if clash_mgr and clash_mgr.needs_reconnect(my_generation):
+            try:
+                await page.goto(SEED_URL, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(random.randint(1000, 2000))
+                my_generation = clash_mgr.generation  # 同步到最新代数
+                print(f"  [W{worker_id}] 页面已刷新, 新连接走节点: {clash_mgr.current_node} ✓")
+            except Exception as e:
+                print(f"  [W{worker_id}] 刷新页面失败: {str(e)[:60]}, 继续...")
+                my_generation = clash_mgr.generation  # 即使失败也同步, 避免反复重试
 
         # 酒店带名称的显示标签 (如 "HKGKL (香港金域假日)")
         label = format_hotel_label(hotel_code)
