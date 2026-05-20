@@ -589,6 +589,7 @@ async def worker(worker_id, page, task_queue, results, windows, dry_run, clash_m
                 "elapsed": elapsed,
                 "is_first_run": not bool(old_prices),
                 "baseline_date": old_date,  # 上次采集时间, 用于报告对比基准
+                "prices": prices,  # 本次快照, 供 notify 模块做高性价比扫描
             })
             status = "首次" if not old_prices else f"{len(changes)}变化"
             print(f"  [{idx}/{total_count}] {label} ✓ {elapsed:.1f}s ({len(prices)}天, {status})")

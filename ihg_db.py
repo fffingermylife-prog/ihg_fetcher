@@ -198,6 +198,29 @@ class IHGDatabase:
         """, (hotel_code,)).fetchall()
         return [r["fetch_date"] for r in rows]
 
+    def get_all_cash_prices(self, hotel_code):
+        """获取该酒店所有历史快照中的非空现金价 (优先含税)
+        Returns: [(date, value), ...] 同一日期可能多条 (来自不同 fetch_date)
+        """
+        rows = self.conn.execute("""
+            SELECT date, cash_price_after_tax, cash_price
+            FROM prices
+            WHERE hotel_code = ?
+              AND (cash_price_after_tax IS NOT NULL OR cash_price IS NOT NULL)
+        """, (hotel_code,)).fetchall()
+        return [(r["date"], r["cash_price_after_tax"] or r["cash_price"]) for r in rows]
+
+    def get_all_points_prices(self, hotel_code):
+        """获取该酒店所有历史快照中的非空积分价
+        Returns: [(date, value), ...]
+        """
+        rows = self.conn.execute("""
+            SELECT date, points
+            FROM prices
+            WHERE hotel_code = ? AND points IS NOT NULL
+        """, (hotel_code,)).fetchall()
+        return [(r["date"], r["points"]) for r in rows]
+
     def get_stats(self):
         """获取数据库统计信息"""
         hotel_count = self.conn.execute("SELECT COUNT(*) as cnt FROM hotels").fetchone()["cnt"]

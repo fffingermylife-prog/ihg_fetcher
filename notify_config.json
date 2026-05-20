@@ -4,7 +4,11 @@
     "points_drop_pct": 40,
     "cash_drop_pct": 40,
     "new_date_below_avg_pct": 30,
-    "reopen_max_ratio": 0.9
+    "reopen_max_ratio": 0.9,
+    "cash_deal_ratio": 0.6,
+    "min_cpp_threshold": 0.6,
+    "top_n_per_hotel": 5,
+    "min_baseline_samples": 14
   },
   "hotels": {
     "DADHA": {"note": "岘港洲际"},
