@@ -55,7 +55,7 @@
 - 新增 CLI: `python ihg_notify.py --url HKGKL:2026-10-01[:nights]` 快速生成单个链接
 - ⚠️ **预订链接已修复**: 使用 IHG redirect 服务 + `adjustMonth=true` + `monthIndex=01`
 
-### 5. Clash 代理自动切换 (`ihg_clash_proxy.py`) ✨ 新增
+### 5. Clash 代理自动切换 (`ihg_clash_proxy.py`)
 - 通过 Clash RESTful API 自动切换节点
 - 定期轮换：每处理 N 个酒店随机切换节点（默认 5）
 - 失败切换：请求失败/超时时立即切换
@@ -63,6 +63,9 @@
 - **secret 自动清理**: 剔除非 ASCII 字符（避免 latin-1 编码错误），中文引号去除
 - **URL 编码分组名**: 用 `urllib.parse.quote` 处理 emoji/中文分组名
 - 启动前测试代理连通性（用 `cp.cloudflare.com/generate_204`，**不能用 IHG 测**因为会被 Akamai 反爬拦截返回 403）
+- **✨ 代数计数器机制**: 解决 Playwright 持久连接导致切换节点后流量仍走旧节点的问题
+  - 每次切换 `_switch_generation` +1，worker 检测代数变化后自动 `page.goto()` 刷新页面
+  - 多 Worker 并发安全：每个 Worker 独立记录自己的代数
 - 独立运行: `--test` / `--list` / `--current` / `--switch` / `--rotate`
 - 配置在 `notify_config.json` 的 `clash` 字段
 
@@ -72,10 +75,13 @@
 - 检测到新日期开放后自动停止
 - 日志保存到 `ihg_open_time_<CODE>.log`
 
-### 7. 旧版工具 (保留)
-- `ihg_price_monitor.py` - 单酒店价格监控 (被 batch_monitor 替代)
-- `ihg_test_calendar_price.py` - 单酒店全年价格获取
-- `ihg_debug_calendar.py` - Calendar API 调试
+### 7. 旧版工具 (已清理删除)
+- 以下文件已在项目精简中删除，功能已被核心模块覆盖：
+  - `ihg_price_monitor.py` → 被 `ihg_batch_monitor.py` 替代
+  - `ihg_playwright_fetcher.py` → 被 batch_monitor 内置 fetch 替代
+  - `ihg_calendar_price.py` → 旧版纯 Python + Cookie，不再使用
+  - `ihg_calendar_browser.js` / `ihg_diagnostic.js` / `ihg_extract_cookie.js` → 一次性工具
+  - `ihg_test_calendar_price.py` / `ihg_test_single_region.py` / `ihg_debug_calendar.py` → 测试/调试脚本
 
 ---
 
@@ -104,6 +110,7 @@
 | 浏览器内并发 | 同一 page 的 6 个 fetch 并发会被 Akamai 限流，**不可行** |
 | Clash 代理 | 通过 `--proxy http://127.0.0.1:7890` 走 Clash，已验证可用 |
 | Clash for Windows API | external-controller 端口在客户端 Settings 中查看（不是 config.yaml 里的） |
+| Playwright 持久连接 | 浏览器到 Clash 本地代理的 TCP 连接是 Keep-Alive 的，切节点只对新连接生效，需 page.goto() 强制断开旧连接 |
 
 ---
 
@@ -141,7 +148,8 @@
 | Windows 命令行输出卡住 | Python stdout 缓冲 | `sys.stdout.reconfigure(line_buffering=True)` |
 | 浏览器内 6 请求并发卡死 | Akamai 限流同 session 并发 | 回退为串行请求 |
 | Clash secret 含中文导致 latin-1 错误 | HTTP 头不允许非 ASCII | `_sanitize_secret` 自动剔除非 ASCII 字符 |
-| Clash 切换节点不生效 | 用户在 Global 模式但代码切的是 Proxies 组 | 改成切 GLOBAL 组 + 加 only_flag_emoji 过滤 |
+| Clash 切换节点不生效 (API层面) | 用户在 Global 模式但代码切的是 Proxies 组 | 改成切 GLOBAL 组 + 加 only_flag_emoji 过滤 |
+| Clash 切换后浏览器仍走旧节点 | Playwright 到代理的 TCP 持久连接 (Keep-Alive) 不受 Clash 路由更新影响 | 代数计数器 + 切换后 page.goto() 刷新页面断开旧连接池 |
 | 代理连通性测试 IHG 返回 403 | Akamai 反爬拦截 requests | 改用 Cloudflare 204 端点 (cp.cloudflare.com/generate_204) |
 | 报告含 2027-05-16 售罄(已过期) | compare_prices 没过滤过期日期 | 加 `today_str` 过滤 `[d for d in all_dates if d > today_str]` |
 
@@ -152,23 +160,14 @@
 ```
 fffingermylife-prog/ihg_fetcher (分支: feat/ihg-calendar-price)
 ├── ihg_batch_monitor.py         # 核心: 多酒店批量价格监控 + 通知 + 日志
-├── ihg_hotel_list_fetcher.py    # 正式版: 按国家抓取酒店列表
-├── ihg_notify.py                # 通知模块: Server酱推送 + 预订链接生成
-├── ihg_clash_proxy.py           # ✨ Clash 代理节点自动切换
-├── ihg_db.py                    # 数据库封装: SQLite 读写
+├── ihg_hotel_list_fetcher.py    # 核心: 按国家抓取酒店列表
+├── ihg_notify.py                # 核心: Server酱推送 + 预订链接生成
+├── ihg_clash_proxy.py           # 核心: Clash 代理节点自动切换
+├── ihg_db.py                    # 核心: SQLite 数据库封装
 ├── ihg_detect_open_time.py      # 工具: 新日期开放时间探测
-├── ihg_test_calendar_price.py   # 测试: 单酒店全年价格获取
-├── ihg_debug_calendar.py        # 调试: Calendar API 原始响应查看
-├── ihg_price_monitor.py         # 旧版: 单酒店监控 (已被 batch 替代)
-├── ihg_test_single_region.py    # 测试: 子区域递归酒店列表
-├── ihg_playwright_fetcher.py    # 旧版: 价格抓取
-├── ihg_calendar_price.py        # 旧版: 纯 Python + Cookie
-├── ihg_calendar_browser.js      # 浏览器 Console 版
-├── ihg_diagnostic.js            # API 诊断工具
-├── ihg_extract_cookie.js        # Cookie 提取助手
-├── notify_config.json           # 通知配置 (Server酱 key + 规则 + clash 配置)
-├── .gitignore                   # ✨ 忽略 ihg_data/ ihg_logs/ ihg_browser_profile/
-├── requirements.txt             # playwright, requests
+├── notify_config.json           # 配置: Server酱 key + 告警规则 + Clash 配置
+├── .gitignore                   # 忽略 ihg_data/ ihg_logs/ ihg_browser_profile/
+├── requirements.txt             # 依赖: playwright, requests
 ├── README.md                    # 使用文档
 └── PROJECT_CONTEXT.md           # 本文件
 ```
@@ -310,3 +309,4 @@ https://www.ihg.com/redirect?path=rates&hotelCode=HKGKL&regionCode=1&localeCode=
 - `notify_config.json` 的 `clash.proxy_group` 必须和用户实际使用的模式匹配（Global → "GLOBAL"，Rule → 实际生效的分组名）
 - 微信小程序跳转方案已放弃（无法程序生成），现在走 IHG 官网 redirect 链接，已验证可用
 - IHG redirect 链接关键参数: `adjustMonth=true` + `monthIndex=01`，否则月份会偏移+1
+- Playwright 持久连接问题已解决：切换 Clash 节点后必须 page.goto() 刷新页面，否则旧 TCP 连接仍走原节点（代数计数器机制）
