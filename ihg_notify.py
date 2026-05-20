@@ -160,6 +160,7 @@ def build_booking_url(hotel_code, check_in_date, nights=None):
         "checkInMonthYear": f"{check_in.month:02d}{check_in.year}",
         "checkOutDate": check_out.day,
         "checkOutMonthYear": f"{check_out.month:02d}{check_out.year}",
+        "adjustMonth": "false",
     }
     return f"https://www.ihg.com/redirect?{urlencode(params)}"
 
@@ -240,18 +241,20 @@ def get_hotel_avg_cash(db, hotel_code):
 
 
 def get_hotel_display_name(hotel_code, db, config):
-    """获取酒店显示名称: 优先从数据库读取, 其次用配置备注, 最后用代码"""
+    """获取酒店显示名称: 优先从数据库读取, 其次用配置备注, 最后用代码
+    
+    格式: "酒店全名 [代码]"  或  "备注 [代码]"  或  "代码"
+    """
     # 1. 从数据库读取 (最准确)
     hotel_info = db.get_hotel(hotel_code)
     if hotel_info and hotel_info.get("name"):
         name = hotel_info["name"]
-        country = hotel_info.get("country", "")
-        return f"{name} ({country})" if country else name
+        return f"{name} [{hotel_code}]"
 
     # 2. 从配置文件读备注
     note = config.get("hotels", {}).get(hotel_code, {}).get("note", "")
     if note:
-        return note
+        return f"{note} [{hotel_code}]"
 
     # 3. 只返回代码
     return hotel_code
