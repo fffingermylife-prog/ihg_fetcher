@@ -156,11 +156,16 @@ def build_booking_url(hotel_code, check_in_date, nights=None):
     params = {
         "path": "rates",
         "hotelCode": hotel_code,
+        "regionCode": "1",
+        "localeCode": "en",
         "checkInDate": check_in.day,
         "checkInMonthYear": f"{check_in.month:02d}{check_in.year}",
         "checkOutDate": check_out.day,
         "checkOutMonthYear": f"{check_out.month:02d}{check_out.year}",
+        "numberOfAdults": "1",
+        "numberOfRooms": "1",
         "adjustMonth": "false",
+        "monthIndex": "00",
     }
     return f"https://www.ihg.com/redirect?{urlencode(params)}"
 
