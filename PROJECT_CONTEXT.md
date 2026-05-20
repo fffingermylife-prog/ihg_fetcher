@@ -53,7 +53,7 @@
 - 配置文件: `notify_config.json`
 - **每条告警自动附 IHG 官网 H5 预订链接** (酒店名+日期参数都已预填)
 - 新增 CLI: `python ihg_notify.py --url HKGKL:2026-10-01[:nights]` 快速生成单个链接
-- ⚠️ **预订链接 URL 格式待验证**：当前用 `https://www.ihg.com/hotels/cn/zh/find-hotels/hotel/rooms?qSlH=...` 用户测试反馈 page not found；下次会话需要找到正确路径
+- ⚠️ **预订链接已修复**: 使用 IHG redirect 服务 + `adjustMonth=true` + `monthIndex=01`
 
 ### 5. Clash 代理自动切换 (`ihg_clash_proxy.py`) ✨ 新增
 - 通过 Clash RESTful API 自动切换节点
@@ -122,11 +122,10 @@
 - 但需要 IHG 在自己 app.json 里加白名单或微信开放平台互跳授权
 - 个人小程序大概率没有授权，且微信审核会卡
 
-### ✅ HTTP 链接方案（当前路线）
-- 通知里附 `https://www.ihg.com/.../find-hotels/hotel/rooms?qSlH=HKGKL&qCiD=1&qCiMy=102026...`
-- 用户在微信里点击 → 内置浏览器打开 → IHG H5 预订页（预填酒店+日期）
-- ⚠️ **当前问题**: 测试 `cn/zh` 路径返回 `page not found`，需要找到 IHG 中文/英文的正确预订路径
-- 通过 web_search 看到 IHG 真实路径形如 `https://www.ihg.com/holidayinn/hotels/us/en/hong-kong/hkgkl/hoteldetail`，但**这是酒店详情页不是预订页**，需要进一步抓包国际版网站的真实预订 URL
+### ✅ HTTP 链接方案（已验证可用）
+- 通知里附 `https://www.ihg.com/redirect?path=rates&hotelCode=HKGKL&regionCode=1&localeCode=en&checkInDate=1&checkInMonthYear=102026&...&adjustMonth=true&monthIndex=01`
+- 用户在微信里点击 → 内置浏览器打开 → IHG 预订页（预填酒店+日期）
+- **已验证**: `adjustMonth=true` + `monthIndex=01` 可确保日期不偏移
 
 ---
 
@@ -261,15 +260,23 @@ python ihg_detect_open_time.py --code HKGKL
 
 ## 下一步计划
 
-### 🔥 优先级 1: 修复预订链接 URL 格式
-**当前问题**: `https://www.ihg.com/hotels/cn/zh/find-hotels/hotel/rooms?qSlH=...` 返回 `page not found`
+### ✅ 已完成: 预订链接 URL 修复
+**问题**: 原来的 `/hotels/cn/zh/find-hotels/hotel/rooms?qSlH=...` 路径无法访问
 
-**待办**:
-- 用户用电脑浏览器在 IHG 中文/英文官网搜一家酒店选好日期后，把**最终房型选择页**的完整 URL 抓出来
-- 对照 `ihg_notify.py` 的 `build_booking_url()` 修正 URL 格式
-- 可能正确的路径不是 `find-hotels/hotel/rooms`，而是其他（比如 brand 子路径 `holidayinn/hotels/us/en/.../hoteldetail`）
-- 也可以参考 IHG 国际版搜索 URL：站内 `/hotels/<country>/<lang>/find-hotels/hotel-search?qSlH=HKGKL...`
-- 验证成功的 URL 格式后，更新 `BOOKING_URL_LANG` 默认值，确保中英文都能用
+**解决方案**: 改用 IHG 官方 redirect 服务 `https://www.ihg.com/redirect?...`
+
+**关键参数发现** (经用户实测验证):
+- `adjustMonth` 必须设为 `true` (设为 false 会导致月份偏移+1)
+- `monthIndex` 必须设为 `01` (设为 00 同样会偏移)
+- 需要 `regionCode=1` + `localeCode=en`
+- 需要 `numberOfAdults=1` + `numberOfRooms=1`
+
+**最终可用的 URL 格式**:
+```
+https://www.ihg.com/redirect?path=rates&hotelCode=HKGKL&regionCode=1&localeCode=en&checkInDate=1&checkInMonthYear=102026&checkOutDate=2&checkOutMonthYear=102026&numberOfAdults=1&numberOfRooms=1&adjustMonth=true&monthIndex=01
+```
+
+**同时修复**: 酒店名显示改为 `"酒店全名 [代码]"` 格式，确保推送内容显示酒店全名
 
 ### 优先级 2: 数据分析输出
 - CPP 排行榜：哪些酒店积分性价比最高
@@ -301,4 +308,5 @@ python ihg_detect_open_time.py --code HKGKL
 - Server酱 SendKey 已配置在 notify_config.json 中
 - Clash for Windows API 端口在客户端 Settings 里查看实际值（每次启动可能变），**不是** config.yaml 里写的端口
 - `notify_config.json` 的 `clash.proxy_group` 必须和用户实际使用的模式匹配（Global → "GLOBAL"，Rule → 实际生效的分组名）
-- 微信小程序跳转方案已放弃（无法程序生成），现在走 IHG 官网 H5 链接路线，但 URL 格式还需验证
+- 微信小程序跳转方案已放弃（无法程序生成），现在走 IHG 官网 redirect 链接，已验证可用
+- IHG redirect 链接关键参数: `adjustMonth=true` + `monthIndex=01`，否则月份会偏移+1

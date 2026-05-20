@@ -180,8 +180,11 @@ class ClashProxyManager:
             self.available_nodes = []
 
     def _switch_to(self, node_name):
-        """切换到指定节点"""
+        """切换到指定节点, 同时切换所有相关代理组确保生效"""
         try:
+            old = self.current_node
+
+            # 1. 切换主代理组 (如 GLOBAL)
             url = self._build_proxy_url()
             resp = requests.put(
                 url,
@@ -189,16 +192,32 @@ class ClashProxyManager:
                 json={"name": node_name},
                 timeout=5,
             )
-            if resp.status_code == 204 or resp.status_code == 200:
-                old = self.current_node
-                self.current_node = node_name
-                self.switch_count += 1
-                self.fail_count = 0  # 重置连续失败计数
-                print(f"[Clash] 切换节点: {old} → {node_name} (第{self.switch_count}次)")
-                return True
-            else:
-                print(f"[Clash] 切换失败: HTTP {resp.status_code} - {resp.text}")
+            if resp.status_code not in (200, 204):
+                print(f"[Clash] 切换 {self.proxy_group} 失败: HTTP {resp.status_code} - {resp.text}")
                 return False
+
+            # 2. 同时尝试切换 Proxies 组 (Global 模式下, 流量可能走 Proxies 子组)
+            #    如果主组不是 Proxies, 则也切换 Proxies 确保生效
+            if self.proxy_group.upper() != "PROXIES":
+                try:
+                    proxies_url = self._build_proxy_url("Proxies")
+                    requests.put(
+                        proxies_url,
+                        headers=self._headers(),
+                        json={"name": node_name},
+                        timeout=5,
+                    )
+                except Exception:
+                    pass  # Proxies 组可能不存在或节点不在该组, 忽略
+
+            self.current_node = node_name
+            self.switch_count += 1
+            self.fail_count = 0  # 重置连续失败计数
+            print(f"[Clash] 切换节点: {old} → {node_name} (第{self.switch_count}次)")
+
+            # 3. 等待切换生效 (让已有连接断开/新连接走新节点)
+            time.sleep(1.5)
+            return True
         except Exception as e:
             print(f"[Clash] 切换异常: {e}")
             return False
