@@ -42,17 +42,25 @@
 
 ### 4. 价格告警通知 (`ihg_notify.py`)
 - Server酱微信推送
-- 4级告警规则（**已收紧阈值**）:
-  - 🔴 积分房重新开放: 节假日 + 价格 ≤ 平日均价×0.9 (`reopen_max_ratio: 0.9`)
-  - 🟠 积分降价: 降幅 ≥ 40%
-  - 🟡 现金降价: 降幅 ≥ 40%
-  - 🟢 新日期低价: 价格 ≤ 历史均价×0.7 (`new_date_below_avg_pct: 30`)
+- **6级告警规则**（按优先级从高到低）:
+  - 🔴 积分房重新开放: 节假日 + 积分 ≤ 平日均价×0.9 (`reopen_max_ratio: 0.9`)
+  - 💎 高 CPP 积分房: 任意未来日期 + CPP ≥ 0.6 (`min_cpp_threshold: 0.6`)
+  - 🟣 现金深折扣: 任意未来日期 + 现金 ≤ 平日均价×0.6 (`cash_deal_ratio: 0.6`)
+  - 🟠 积分降价: 降幅 ≥ 40% (`points_drop_pct: 40`)
+  - 🟡 现金降价: 降幅 ≥ 40% (`cash_drop_pct: 40`)
+  - 🟢 新日期低价: 新开放日期 + 价格 ≤ 均价×0.7 (`new_date_below_avg_pct: 30`)
+- **智能基准均价** (`compute_baseline`):
+  - 历史所有快照平日(周一~周四非节假日)样本 ≥ `min_baseline_samples`(14) → 用历史均价
+  - 否则 fallback 到本次快照平日均价（首次采集场景）
+  - 都不足 → 跳过该酒店性价比检测，避免误报
+- **每家酒店最多推送 `top_n_per_hotel`(5) 条高性价比**，按性价比从高到低排序
+  - 现金: 按折扣率(1 - 当前/基准)降序
+  - 积分: 按 (CPP - 阈值)/阈值 降序
 - 中国节假日识别 2026~2027 (含前后2天缓冲)
-- 平日均价计算 = **周一~周四 + 非节假日 + 当天有价格**（排除周末和节假日避免拉高均价）
+- 告警去重: (hotel, date, dim) 保留最高级别
 - 酒店名从数据库自动读取
-- 配置文件: `notify_config.json`
 - **每条告警自动附 IHG 官网 H5 预订链接** (酒店名+日期参数都已预填)
-- 新增 CLI: `python ihg_notify.py --url HKGKL:2026-10-01[:nights]` 快速生成单个链接
+- CLI: `python ihg_notify.py --url HKGKL:2026-10-01[:nights]` 快速生成单个链接
 - ⚠️ **预订链接已修复**: 使用 IHG redirect 服务 + `adjustMonth=true` + `monthIndex=01`
 
 ### 5. Clash 代理自动切换 (`ihg_clash_proxy.py`)
@@ -152,6 +160,10 @@
 | Clash 切换后浏览器仍走旧节点 | Playwright 到代理的 TCP 持久连接 (Keep-Alive) 不受 Clash 路由更新影响 | 代数计数器 + 切换后 page.goto() 刷新页面断开旧连接池 |
 | 代理连通性测试 IHG 返回 403 | Akamai 反爬拦截 requests | 改用 Cloudflare 204 端点 (cp.cloudflare.com/generate_204) |
 | 报告含 2027-05-16 售罄(已过期) | compare_prices 没过滤过期日期 | 加 `today_str` 过滤 `[d for d in all_dates if d > today_str]` |
+| 通知基准均价不准 | `get_hotel_avg_*` 仅取 `load_latest_prices()` 一次快照 | 改用 `get_all_cash_prices/get_all_points_prices` 取所有历史快照, 不足14样本时 fallback 本次快照 |
+| 新开放日期同时积分+现金低价时漏报 | 原 `if not alert and ...` 互斥判定 | 拆为两个独立 if 分别检查积分和现金 |
+| `new_date_below_avg_pct` 默认值不一致 | 配置 30, 代码硬编码 fallback 40 | 统一默认为 30 |
+| 首次采集无历史基准, 找不到高性价比日期 | 旧逻辑只能比较历史 | 新增"首次采集 fallback 本次快照平日均价" |
 
 ---
 
@@ -182,8 +194,12 @@ fffingermylife-prog/ihg_fetcher (分支: feat/ihg-calendar-price)
   "rules": {
     "points_drop_pct": 40,
     "cash_drop_pct": 40,
-    "new_date_below_avg_pct": 30,    // 新日期 ≤ 均价×0.7
-    "reopen_max_ratio": 0.9          // 节假日重新开放 ≤ 均价×0.9
+    "new_date_below_avg_pct": 30,    // 🟢 新开放日期 ≤ 均价×0.7
+    "reopen_max_ratio": 0.9,         // 🔴 节假日积分房重开 ≤ 平日均价×0.9
+    "cash_deal_ratio": 0.6,          // 🟣 现金深折扣 ≤ 平日均价×0.6
+    "min_cpp_threshold": 0.6,        // 💎 高 CPP 积分房 ≥ 0.6
+    "top_n_per_hotel": 5,            // 每酒店最多推送 N 条高性价比
+    "min_baseline_samples": 14       // 平日均价至少 N 个有效样本
   },
   "hotels": {
     "DADHA": {"note": "岘港洲际"},
