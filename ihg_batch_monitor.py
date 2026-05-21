@@ -1014,8 +1014,8 @@ async def main():
                         help="从 SQLite 数据库读取酒店代码")
     parser.add_argument("--country", type=str, default=None,
                         help="配合 --from-db 按国家筛选酒店")
-    parser.add_argument("--concurrency", type=int, default=2,
-                        help="并发 Tab 数 (默认 2, 最大 3)")
+    parser.add_argument("--concurrency", type=int, default=3,
+                        help="并发 Tab 数 (默认 3, 最大 3)")
     parser.add_argument("--incremental", action="store_true",
                         help="增量模式: 只获取最远 62 天窗口")
     parser.add_argument("--days", type=int, default=365,

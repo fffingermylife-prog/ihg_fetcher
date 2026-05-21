@@ -44,7 +44,7 @@ DEFAULT_RULES = {
     "cash_deal_ratio": 0.5,          # 🟣 现金 ≤ 平日均价×50%
     "cash_drop_pct": 50,             # 🟡 同日现金降幅 ≥ 50% 推送
     "top_n_per_hotel": 5,            # 每酒店最多入围 N 条 (预筛)
-    "top_n_global": 10,              # 全局最终推送条数
+    "top_n_global": 30,              # 全局最终推送条数
 }
 
 
@@ -280,15 +280,19 @@ def filter_alerts(results, db, config):
             cpp = p.get("cpp")  # USD 美分/积分
 
             # 💎 高 CPP 积分房
+            # 额外条件: 积分不能高于平日积分均价 (排除现金 bug 价导致 CPP 虚高)
             if cpp and cpp >= min_cpp and points:
-                hotel_snapshot_alerts.append({
-                    "level": "💎", "rank": 0,
-                    "type": "高CPP积分房",
-                    "hotel": hotel_code, "label": label, "date": d,
-                    "detail": f"{points}分 ≈${cash_usd:.0f} CPP={cpp:.2f}¢",
-                    "score": cpp,
-                    "threshold": min_cpp,
-                })
+                if avg_points and points > avg_points:
+                    pass  # 积分高于均价 → 大概率是现金 bug 价, 跳过
+                else:
+                    hotel_snapshot_alerts.append({
+                        "level": "💎", "rank": 0,
+                        "type": "高CPP积分房",
+                        "hotel": hotel_code, "label": label, "date": d,
+                        "detail": f"{points}分 ≈${cash_usd:.0f} CPP={cpp:.2f}¢",
+                        "score": cpp,
+                        "threshold": min_cpp,
+                    })
 
             # 🟠 节假日积分低价
             ratio = rules.get("holiday_points_ratio", 0.9)
