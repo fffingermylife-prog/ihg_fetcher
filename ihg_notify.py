@@ -314,10 +314,9 @@ def filter_alerts(results, db, config):
                     "score": pct,
                 })
 
-        # 每酒店预筛 top_n_per_hotel
-        top_n = rules.get("top_n_per_hotel", 5)
+        # 每酒店按 score 排序后全部加入 (全量文件需要所有, 推送最后只取 top_n_global)
         hotel_snapshot_alerts.sort(key=lambda x: -x["score"])
-        all_alerts.extend(hotel_snapshot_alerts[:top_n])
+        all_alerts.extend(hotel_snapshot_alerts)
 
         # === 基于 changes 的历史对比 ===
         for c in changes:
@@ -363,10 +362,60 @@ def filter_alerts(results, db, config):
     for a in all_alerts:
         a["weight"] = compute_weight(a)
 
-    # 全局按权重降序排, 取 top_n_global
+    # 全局按权重降序排
     all_alerts.sort(key=lambda a: -a["weight"])
+
+    # 写入全量告警文件 (所有触发条件的, 不限条数, 供回查)
+    _write_all_alerts_file(all_alerts)
+
+    # 推送只取 top_n_global
     top_n_global = rules.get("top_n_global", 10)
     return all_alerts[:top_n_global]
+
+
+def _write_all_alerts_file(all_alerts):
+    """将全量告警写入文件 (按权重排序, 不限条数)
+    文件路径: ./ihg_logs/alerts_YYYYMMDD_HHMMSS.md
+    """
+    if not all_alerts:
+        return None
+    try:
+        from datetime import datetime
+        log_dir = Path(__file__).parent / "ihg_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_path = log_dir / f"alerts_{ts}.md"
+
+        lines = []
+        lines.append(f"# IHG 全量告警 ({len(all_alerts)}条)")
+        lines.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"按权重降序排列\n")
+
+        # 按酒店分组
+        from collections import OrderedDict
+        hotel_groups = OrderedDict()
+        for a in all_alerts:
+            code = a["hotel"]
+            if code not in hotel_groups:
+                hotel_groups[code] = {"label": a["label"], "items": []}
+            hotel_groups[code]["items"].append(a)
+
+        for code, group in hotel_groups.items():
+            lines.append(f"## {group['label']} ({len(group['items'])}条)\n")
+            for a in group["items"]:
+                url = build_booking_url(code, a["date"])
+                lines.append(f"- {a['level']} `{a['date']}` W={a['weight']:.0f} | {a['detail']} [预订]({url})")
+            lines.append("")
+
+        lines.append(f"\n---\n共 {len(all_alerts)} 条告警, {len(hotel_groups)} 家酒店")
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        print(f"[通知] 全量告警已写入: {file_path} ({len(all_alerts)}条)")
+        return file_path
+    except Exception as e:
+        print(f"[通知] 写全量告警文件失败: {e}")
+        return None
 
 
 def _get_hotel_label(hotel_code, db, config):
