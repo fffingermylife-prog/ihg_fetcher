@@ -37,7 +37,7 @@ except ImportError:
 CONFIG_PATH = Path(__file__).parent / "notify_config.json"
 
 DEFAULT_RULES = {
-    "min_cpp_threshold": 0.7,        # 💎 CPP ≥ 0.7 视为高性价比积分房
+    "min_cpp_threshold": 0.8,        # 💎 CPP ≥ 0.8 视为高性价比积分房 (USD 美分/积分)
     "points_drop_pct": 40,           # 🔴 同日积分降幅 ≥ 40% 推送
     "holiday_points_ratio": 0.9,     # 🟠 节假日积分 ≤ 平日均价×0.9
     "cash_deal_ratio": 0.5,          # 🟣 现金 ≤ 平日均价×50%
@@ -97,6 +97,18 @@ def is_weekday_non_holiday(date_str):
     return d.weekday() < 4 and date_str not in HOLIDAY_DATES
 
 
+# ============ 价格显示格式化 ============
+
+def fmt_cash(cash_local, currency, cash_usd):
+    """格式化现金价: '394 MYR (≈$83)' 或 '$83' (USD时不重复显示)"""
+    if not cash_local:
+        return ""
+    cur = currency or ""
+    if cur == "USD" or not cash_usd:
+        return f"${cash_local:.0f}" if cur == "USD" else f"{cash_local:.0f} {cur}"
+    return f"{cash_local:.0f} {cur} (≈${cash_usd:.0f})"
+
+
 # ============ 预订链接 ============
 
 def build_booking_url(hotel_code, check_in_date, nights=1):
@@ -142,7 +154,7 @@ def compute_weekday_avg(prices, kind):
     """从本次快照计算平日均价 (周一~周四, 非节假日)
     Args:
         prices: 本次快照列表
-        kind: "cash" 或 "points"
+        kind: "cash_usd" (现金 USD 均价, 用于跨币种比较) 或 "points"
     Returns:
         均价 float 或 None (样本不足时)
     """
@@ -150,8 +162,8 @@ def compute_weekday_avg(prices, kind):
     for p in prices:
         if not is_weekday_non_holiday(p.get("date", "")):
             continue
-        if kind == "cash":
-            v = p.get("cash_price_after_tax") or p.get("cash_price")
+        if kind == "cash_usd":
+            v = p.get("cash_price_usd")  # 统一 USD, 不再用本地币
         else:
             v = p.get("points")
         if v:
@@ -179,8 +191,8 @@ def filter_alerts(results, db, config):
         # 获取酒店显示名
         label = _get_hotel_label(hotel_code, db, config)
 
-        # 计算本次快照平日均价
-        avg_cash = compute_weekday_avg(prices, "cash")
+        # 计算本次快照平日均价 (现金均价用 USD, 跨币种可比)
+        avg_cash_usd = compute_weekday_avg(prices, "cash_usd")
         avg_points = compute_weekday_avg(prices, "points")
 
         # === 基于本次快照的扫描 (无需历史, 首次采集就能触发) ===
@@ -192,20 +204,23 @@ def filter_alerts(results, db, config):
             if not d or d <= today_str:
                 continue
 
-            cash = p.get("cash_price_after_tax") or p.get("cash_price")
+            cash_local = p.get("cash_price_after_tax") or p.get("cash_price")
+            cash_usd = p.get("cash_price_usd")
+            currency = p.get("currency", "")
             points = p.get("points")
-            cpp = p.get("cpp")
+            cpp = p.get("cpp")  # 已是 USD 美分/积分
 
-            # 💎 高 CPP 积分房
-            min_cpp = rules.get("min_cpp_threshold", 0.7)
+            # 💎 高 CPP 积分房 (CPP 单位: USD 美分/积分)
+            min_cpp = rules.get("min_cpp_threshold", 0.8)
             if cpp and cpp >= min_cpp and points:
-                cash_hint = f", 现金{cash:.0f}{p.get('currency','')}" if cash else ""
+                cash_str = fmt_cash(cash_local, currency, cash_usd)
+                cash_hint = f", 现金{cash_str}" if cash_str else ""
                 hotel_snapshot_alerts.append({
                     "level": "💎", "rank": 0,
                     "type": "高CPP积分房",
                     "hotel": hotel_code, "label": label, "date": d,
-                    "detail": f"积分{points}{cash_hint}, CPP={cpp:.2f}",
-                    "score": cpp,  # CPP 越高越好
+                    "detail": f"积分{points}{cash_hint}, CPP={cpp:.2f}¢/分",
+                    "score": cpp,
                 })
 
             # 🟠 节假日积分低价
@@ -218,18 +233,19 @@ def filter_alerts(results, db, config):
                     "hotel": hotel_code, "label": label, "date": d,
                     "holiday": get_holiday_name(d),
                     "detail": f"积分{points} (均价{avg_points:.0f}, -{pct:.0f}%) 🎉{get_holiday_name(d)}",
-                    "score": pct,  # 低于均价百分比越大越好
+                    "score": pct,
                 })
 
-            # 🟣 现金深折扣
+            # 🟣 现金深折扣 (用 USD 价对比 USD 均价, 跨币种统一)
             deal_ratio = rules.get("cash_deal_ratio", 0.5)
-            if cash and avg_cash and cash <= avg_cash * deal_ratio:
-                pct = (1 - cash / avg_cash) * 100
+            if cash_usd and avg_cash_usd and cash_usd <= avg_cash_usd * deal_ratio:
+                pct = (1 - cash_usd / avg_cash_usd) * 100
+                cash_str = fmt_cash(cash_local, currency, cash_usd)
                 hotel_snapshot_alerts.append({
                     "level": "🟣", "rank": 3,
                     "type": "现金深折扣",
                     "hotel": hotel_code, "label": label, "date": d,
-                    "detail": f"含税{cash:.0f}{p.get('currency','')} (均价{avg_cash:.0f}, -{pct:.0f}%)",
+                    "detail": f"含税{cash_str} (均价≈${avg_cash_usd:.0f}, -{pct:.0f}%)",
                     "score": pct,
                 })
 

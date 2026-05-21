@@ -35,7 +35,7 @@ class IHGDatabase:
         self._create_tables()
 
     def _create_tables(self):
-        """创建表 (如果不存在)"""
+        """创建表 (如果不存在) + 自动 migration"""
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS hotels (
                 mnemonic     TEXT PRIMARY KEY,
@@ -57,6 +57,7 @@ class IHGDatabase:
                 date                 TEXT NOT NULL,
                 cash_price           REAL,
                 cash_price_after_tax REAL,
+                cash_price_usd       REAL,
                 currency             TEXT,
                 points               INTEGER,
                 cpp                  REAL,
@@ -69,6 +70,10 @@ class IHGDatabase:
             CREATE INDEX IF NOT EXISTS idx_prices_fetch_date
                 ON prices(fetch_date);
         """)
+        # Migration: 老库可能没有 cash_price_usd 字段, 加上
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(prices)").fetchall()}
+        if "cash_price_usd" not in cols:
+            self.conn.execute("ALTER TABLE prices ADD COLUMN cash_price_usd REAL")
         self.conn.commit()
 
     # ============ 酒店操作 ============
@@ -129,7 +134,9 @@ class IHGDatabase:
     # ============ 价格操作 ============
 
     def save_prices(self, hotel_code, prices, fetch_date=None):
-        """保存价格数据 (批量插入, 忽略重复)"""
+        """保存价格数据 (批量插入, 忽略重复)
+        注: cpp 字段含义为 USD 美分/积分 (新版), 旧版数据可能是本地币*100/积分, 统计时需注意
+        """
         if not fetch_date:
             fetch_date = date.today().isoformat()
 
@@ -140,6 +147,7 @@ class IHGDatabase:
                 p.get("date"),
                 p.get("cash_price"),
                 p.get("cash_price_after_tax"),
+                p.get("cash_price_usd"),
                 p.get("currency"),
                 p.get("points"),
                 p.get("cpp"),
@@ -148,8 +156,8 @@ class IHGDatabase:
 
         self.conn.executemany("""
             INSERT OR IGNORE INTO prices
-                (hotel_code, date, cash_price, cash_price_after_tax, currency, points, cpp, fetch_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (hotel_code, date, cash_price, cash_price_after_tax, cash_price_usd, currency, points, cpp, fetch_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
         self.conn.commit()
 
@@ -170,7 +178,8 @@ class IHGDatabase:
 
         # 取该次采集的所有价格
         rows = self.conn.execute("""
-            SELECT date, cash_price, cash_price_after_tax, currency, points, cpp
+            SELECT date, cash_price, cash_price_after_tax, cash_price_usd,
+                   currency, points, cpp
             FROM prices
             WHERE hotel_code = ? AND fetch_date = ?
             ORDER BY date
@@ -182,7 +191,8 @@ class IHGDatabase:
     def get_price_history(self, hotel_code, target_date):
         """获取某酒店某天的历史价格变化"""
         rows = self.conn.execute("""
-            SELECT fetch_date, cash_price, cash_price_after_tax, currency, points, cpp
+            SELECT fetch_date, cash_price, cash_price_after_tax, cash_price_usd,
+                   currency, points, cpp
             FROM prices
             WHERE hotel_code = ? AND date = ?
             ORDER BY fetch_date

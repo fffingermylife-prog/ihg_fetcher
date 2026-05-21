@@ -4,7 +4,7 @@
   "server_chan_key": "SCT350235TLGERB0nU0NYLf0DpqhyHDnDz",
 
   "_rules_说明": {
-    "min_cpp_threshold": "💎 高CPP积分房: CPP >= 此值触发 (0.7 = 每万分价值70元人民币)",
+    "min_cpp_threshold": "💎 高CPP积分房: CPP >= 此值触发, 单位 USD美分/积分 (0.8 = 每万积分换 $80 以上的房, 极佳性价比)",
     "points_drop_pct": "🔴 积分同日暴降: 同一日期积分降幅 >= 此百分比触发",
     "holiday_points_ratio": "🟠 节假日积分低价: 节假日积分 <= 平日均价×此值触发 (0.9 = 低于均价10%)",
     "cash_deal_ratio": "🟣 现金深折扣: 现金 <= 平日均价×此值触发 (0.5 = 半价以下)",
@@ -12,7 +12,7 @@
     "top_n_per_hotel": "每家酒店最多推送的高性价比条数, 按性价比从高到低排列"
   },
   "rules": {
-    "min_cpp_threshold": 0.7,
+    "min_cpp_threshold": 0.8,
     "points_drop_pct": 40,
     "holiday_points_ratio": 0.9,
     "cash_deal_ratio": 0.5,

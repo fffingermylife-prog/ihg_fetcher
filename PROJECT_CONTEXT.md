@@ -43,11 +43,17 @@
 ### 4. 价格告警通知 (`ihg_notify.py`)
 - Server酱微信推送, 唯一目的: 找到极具性价比的积分房和现金房
 - **5条告警规则**（按优先级从高到低, 条件极端避免噪音）:
-  - 💎 高 CPP 积分房: CPP ≥ 0.7 (`min_cpp_threshold`) — 无需历史, 首次采集即可触发
+  - 💎 高 CPP 积分房: CPP ≥ 0.8 (`min_cpp_threshold`) — **CPP 单位为 USD 美分/积分**, 0.8 表示每万积分价值 $80 以上
   - 🔴 积分同日暴降: 同日积分降幅 ≥ 40% (`points_drop_pct`) — 需历史基准
   - 🟠 节假日积分低价: 节假日 + 积分 ≤ 平日均价×0.9 (`holiday_points_ratio`) — 无需历史
-  - 🟣 现金深折扣: 现金 ≤ 平日均价×0.5 (`cash_deal_ratio`) — 无需历史, 半价以下
+  - 🟣 现金深折扣: 现金 ≤ 平日均价×0.5 (`cash_deal_ratio`) — **均价比较用 USD, 跨币种可比**
   - 🟡 现金同日暴降: 同日现金降幅 ≥ 50% (`cash_drop_pct`) — 需历史基准
+- **货币统一为 USD** (✨ 新增):
+  - IHG Calendar API 返回的是酒店本地币 (MYR/JPY/HKD 等)
+  - 通过 IHG 官方汇率 API `apis.ihg.com/finance/conversions/v2/currencies` 转 USD
+  - 每个币种汇率仅查询一次 (run-level 缓存)
+  - CPP 全球可比, 不再被本地币面值 (如 MYR/JPY) 误导
+  - 通知中同时显示本地价 + USD 等价: 如 `394 MYR (≈$83)`
 - **基准均价策略**: 统一用本次快照平日均价 (周一~周四 + 非节假日)
   - 一次全量 365 天有 ~150 个平日样本, 无需依赖历史
   - 首次采集的酒店也能立即识别高性价比日期
@@ -115,6 +121,8 @@
 | Clash 代理 | 通过 `--proxy http://127.0.0.1:7890` 走 Clash，已验证可用 |
 | Clash for Windows API | external-controller 端口在客户端 Settings 中查看（不是 config.yaml 里的） |
 | Playwright 持久连接 | 浏览器到 Clash 本地代理的 TCP 连接是 Keep-Alive 的，切节点只对新连接生效，需 page.goto() 强制断开旧连接 |
+| 货币转换 API | `apis.ihg.com/finance/conversions/v2/currencies?qFcc=XXX&qTcc=USD&qV=1` 返回 1单位本地币=N USD, 用此API统一货币 |
+| Calendar API 货币 | API 永远返回酒店本地币 (`propertyCurrency`/`lowestRate.currency`), 即使 url 是 `/us/en/`, 需自行调用转换 API |
 
 ---
 
@@ -160,6 +168,7 @@
 | 新开放日期同时积分+现金低价时漏报 | 原 `if not alert and ...` 互斥判定 | 拆为两个独立 if 分别检查积分和现金 |
 | `new_date_below_avg_pct` 默认值不一致 | 配置 30, 代码硬编码 fallback 40 | 统一默认为 30 |
 | 首次采集无历史基准, 找不到高性价比日期 | 旧逻辑只能比较历史 | 新增"首次采集 fallback 本次快照平日均价" |
+| CPP 计算被本地币面值误导 (如 JHBCC 显示 CPP=3.03) | 直接用本地币×100/积分, MYR/JPY 等大面值币种 CPP 虚高 | 引入 IHG 官方汇率 API, 价格统一换算为 USD 后再算 CPP, 阈值改为 0.8 (USD美分/积分) |
 
 ---
 
@@ -196,7 +205,7 @@ fffingermylife-prog/ihg_fetcher (分支: feat/ihg-calendar-price)
     "top_n_per_hotel": "每家酒店最多推送条数"
   },
   "rules": {
-    "min_cpp_threshold": 0.7,
+    "min_cpp_threshold": 0.8,
     "points_drop_pct": 40,
     "holiday_points_ratio": 0.9,
     "cash_deal_ratio": 0.5,
@@ -328,3 +337,5 @@ https://www.ihg.com/redirect?path=rates&hotelCode=HKGKL&regionCode=1&localeCode=
 - 微信小程序跳转方案已放弃（无法程序生成），现在走 IHG 官网 redirect 链接，已验证可用
 - IHG redirect 链接关键参数: `adjustMonth=true` + `monthIndex=01`，否则月份会偏移+1
 - Playwright 持久连接问题已解决：切换 Clash 节点后必须 page.goto() 刷新页面，否则旧 TCP 连接仍走原节点（代数计数器机制）
+- **货币统一为 USD**：所有价格通过 IHG 官方汇率 API 换算为 USD 后再算 CPP，CPP 单位为 USD 美分/积分，阈值 0.8 = 每万积分换 $80 以上
+- **CPP 字段语义已变更**: 旧版 = 本地币×100/积分（受币种面值影响）, 新版 = USD美分/积分（全球可比）, 旧 DB 数据的 CPP 不可直接用于新版阈值比较

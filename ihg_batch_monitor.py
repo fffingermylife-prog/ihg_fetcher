@@ -58,6 +58,10 @@ DATA_DIR = "./ihg_data"
 # Seed URL
 SEED_URL = "https://www.ihg.com/hotels/us/en/find-hotels/hotel/rates"
 
+# 全局汇率缓存 (run-level, 不持久化, 每次运行重新查询)
+# 格式: {"MYR": 0.213, "JPY": 0.00636, "USD": 1.0, ...}
+_usd_rate_cache = {"USD": 1.0}
+
 # 强制 stdout 实时输出 (解决 Windows 命令行缓冲问题)
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -216,6 +220,70 @@ async def fetch_calendar(page, hotel_code, start_date, end_date, points_mode=Fal
     return None
 
 
+# ============ 汇率转换 (本地币 → USD) ============
+
+async def fetch_usd_rate(page, currency):
+    """通过 IHG 官方汇率 API 获取 currency → USD 汇率, 结果缓存到 _usd_rate_cache
+
+    使用 IHG 网站自己的汇率接口 (前端显示美元价时调用的同一个):
+        https://apis.ihg.com/finance/conversions/v2/currencies?qFcc=<from>&qTcc=USD&qV=1
+
+    Args:
+        page: Playwright page (在浏览器内 fetch, 自动带 cookie)
+        currency: 源币种代码 (MYR/JPY/HKD 等)
+
+    Returns:
+        float 汇率 (1 单位本地币 = N USD), 或 None 失败时
+    """
+    if not currency:
+        return None
+    if currency in _usd_rate_cache:
+        return _usd_rate_cache[currency]
+
+    api_url = (
+        f"https://apis.ihg.com/finance/conversions/v2/currencies"
+        f"?qFcc={currency}&qTcc=USD&qV=1"
+    )
+    try:
+        result = await page.evaluate("""
+        async ({ apiUrl, apiKey }) => {
+            try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 10000);
+                const resp = await fetch(apiUrl, {
+                    method: "GET",
+                    headers: {
+                        "accept": "application/json, text/plain, */*",
+                        "x-ihg-api-key": apiKey,
+                    },
+                    credentials: "include",
+                    signal: controller.signal,
+                });
+                clearTimeout(timeout);
+                if (!resp.ok) return { ok: false, status: resp.status };
+                const data = await resp.json();
+                return { ok: true, data: data };
+            } catch (e) {
+                return { ok: false, error: e.message };
+            }
+        }
+        """, {"apiUrl": api_url, "apiKey": API_KEY})
+
+        if result and result.get("ok") and result.get("data"):
+            results = result["data"].get("results", [])
+            if results:
+                rate = results[0].get("result")
+                if rate and rate > 0:
+                    _usd_rate_cache[currency] = rate
+                    print(f"  [汇率] {currency} → USD: {rate:.6f}")
+                    return rate
+        print(f"  [汇率] {currency} → USD 获取失败, 跳过 USD 转换")
+    except Exception as e:
+        print(f"  [汇率] {currency} 异常: {str(e)[:60]}")
+
+    return None
+
+
 # ============ 解析函数 ============
 
 def parse_cash(response_data):
@@ -323,21 +391,38 @@ async def fetch_hotel_prices(page, hotel_code, windows):
     for d in all_dates:
         cash = cash_map.get(d, {})
         pts = points_map.get(d, {})
-        cash_price = cash.get("cash_price")
-        cash_price_after_tax = cash.get("cash_price_after_tax")
-        points_price = pts.get("points")
-        cpp = None
-        price_for_cpp = cash_price_after_tax or cash_price
-        if price_for_cpp and points_price and points_price > 0:
-            cpp = round(price_for_cpp / points_price * 100, 2)
         merged.append({
             "date": d,
-            "cash_price": cash_price,
-            "cash_price_after_tax": cash_price_after_tax,
+            "cash_price": cash.get("cash_price"),
+            "cash_price_after_tax": cash.get("cash_price_after_tax"),
             "currency": cash.get("currency", ""),
-            "points": points_price,
-            "cpp": cpp,
+            "points": pts.get("points"),
         })
+
+    # 获取该酒店所有币种 → USD 汇率 (通常只有一种, 单次查询)
+    currencies = {p["currency"] for p in merged if p.get("currency")}
+    for cur in currencies:
+        await fetch_usd_rate(page, cur)
+
+    # 计算 USD 价格 + CPP (USD 美分/积分)
+    # CPP = USD 价格 × 100 / 积分 = 美分/积分
+    # 例: USD 80, 10000 积分 → CPP = 0.80 美分/积分 (即每万积分价值 $80)
+    for p in merged:
+        cur = p.get("currency")
+        rate = _usd_rate_cache.get(cur) if cur else None
+        cash_local = p.get("cash_price_after_tax") or p.get("cash_price")
+
+        # USD 价格
+        if rate and cash_local:
+            p["cash_price_usd"] = round(cash_local * rate, 2)
+        else:
+            p["cash_price_usd"] = None
+
+        # CPP (USD 美分/积分)
+        if p["cash_price_usd"] and p.get("points") and p["points"] > 0:
+            p["cpp"] = round(p["cash_price_usd"] * 100 / p["points"], 2)
+        else:
+            p["cpp"] = None
 
     return merged
 
