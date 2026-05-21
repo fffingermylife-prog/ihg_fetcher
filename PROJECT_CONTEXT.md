@@ -41,27 +41,23 @@
 - 可独立运行: `python ihg_db.py --stats` / `--hotels` / `--history`
 
 ### 4. 价格告警通知 (`ihg_notify.py`)
-- Server酱微信推送
-- **6级告警规则**（按优先级从高到低）:
-  - 🔴 积分房重新开放: 节假日 + 积分 ≤ 平日均价×0.9 (`reopen_max_ratio: 0.9`)
-  - 💎 高 CPP 积分房: 任意未来日期 + CPP ≥ 0.6 (`min_cpp_threshold: 0.6`)
-  - 🟣 现金深折扣: 任意未来日期 + 现金 ≤ 平日均价×0.6 (`cash_deal_ratio: 0.6`)
-  - 🟠 积分降价: 降幅 ≥ 40% (`points_drop_pct: 40`)
-  - 🟡 现金降价: 降幅 ≥ 40% (`cash_drop_pct: 40`)
-  - 🟢 新日期低价: 新开放日期 + 价格 ≤ 均价×0.7 (`new_date_below_avg_pct: 30`)
-- **智能基准均价** (`compute_baseline`):
-  - 历史所有快照平日(周一~周四非节假日)样本 ≥ `min_baseline_samples`(14) → 用历史均价
-  - 否则 fallback 到本次快照平日均价（首次采集场景）
-  - 都不足 → 跳过该酒店性价比检测，避免误报
-- **每家酒店最多推送 `top_n_per_hotel`(5) 条高性价比**，按性价比从高到低排序
-  - 现金: 按折扣率(1 - 当前/基准)降序
-  - 积分: 按 (CPP - 阈值)/阈值 降序
-- 中国节假日识别 2026~2027 (含前后2天缓冲)
-- 告警去重: (hotel, date, dim) 保留最高级别
-- 酒店名从数据库自动读取
-- **每条告警自动附 IHG 官网 H5 预订链接** (酒店名+日期参数都已预填)
-- CLI: `python ihg_notify.py --url HKGKL:2026-10-01[:nights]` 快速生成单个链接
-- ⚠️ **预订链接已修复**: 使用 IHG redirect 服务 + `adjustMonth=true` + `monthIndex=01`
+- Server酱微信推送, 唯一目的: 找到极具性价比的积分房和现金房
+- **5条告警规则**（按优先级从高到低, 条件极端避免噪音）:
+  - 💎 高 CPP 积分房: CPP ≥ 0.7 (`min_cpp_threshold`) — 无需历史, 首次采集即可触发
+  - 🔴 积分同日暴降: 同日积分降幅 ≥ 40% (`points_drop_pct`) — 需历史基准
+  - 🟠 节假日积分低价: 节假日 + 积分 ≤ 平日均价×0.9 (`holiday_points_ratio`) — 无需历史
+  - 🟣 现金深折扣: 现金 ≤ 平日均价×0.5 (`cash_deal_ratio`) — 无需历史, 半价以下
+  - 🟡 现金同日暴降: 同日现金降幅 ≥ 50% (`cash_drop_pct`) — 需历史基准
+- **基准均价策略**: 统一用本次快照平日均价 (周一~周四 + 非节假日)
+  - 一次全量 365 天有 ~150 个平日样本, 无需依赖历史
+  - 首次采集的酒店也能立即识别高性价比日期
+  - 历史数据仅用于"同日对比" (🔴/🟡 规则)
+- 每家酒店最多推送 `top_n_per_hotel`(5) 条, 按性价比从高到低排序
+- 告警去重: (hotel, date) 保留最高优先级
+- 中国节假日识别 2026~2027 (含前后各2天缓冲)
+- 每条告警自动附 IHG 官网预订链接 (`adjustMonth=true` + `monthIndex=01`)
+- CLI: `python ihg_notify.py --url HKGKL:2026-10-01[:nights]`
+- 所有参数可在 `notify_config.json` 的 `rules` 字段中调整 (含中文说明)
 
 ### 5. Clash 代理自动切换 (`ihg_clash_proxy.py`)
 - 通过 Clash RESTful API 自动切换节点
@@ -191,22 +187,28 @@ fffingermylife-prog/ihg_fetcher (分支: feat/ihg-calendar-price)
 ```json
 {
   "server_chan_key": "SCT...",
+  "_rules_说明": {
+    "min_cpp_threshold": "💎 高CPP积分房: CPP >= 此值触发 (0.7 = 每万分价值70元)",
+    "points_drop_pct": "🔴 积分同日暴降: 降幅 >= 此百分比触发",
+    "holiday_points_ratio": "🟠 节假日积分低价: 积分 <= 平日均价×此值触发",
+    "cash_deal_ratio": "🟣 现金深折扣: 现金 <= 平日均价×此值触发 (0.5=半价)",
+    "cash_drop_pct": "🟡 现金同日暴降: 降幅 >= 此百分比触发",
+    "top_n_per_hotel": "每家酒店最多推送条数"
+  },
   "rules": {
+    "min_cpp_threshold": 0.7,
     "points_drop_pct": 40,
-    "cash_drop_pct": 40,
-    "new_date_below_avg_pct": 30,    // 🟢 新开放日期 ≤ 均价×0.7
-    "reopen_max_ratio": 0.9,         // 🔴 节假日积分房重开 ≤ 平日均价×0.9
-    "cash_deal_ratio": 0.6,          // 🟣 现金深折扣 ≤ 平日均价×0.6
-    "min_cpp_threshold": 0.6,        // 💎 高 CPP 积分房 ≥ 0.6
-    "top_n_per_hotel": 5,            // 每酒店最多推送 N 条高性价比
-    "min_baseline_samples": 14       // 平日均价至少 N 个有效样本
+    "holiday_points_ratio": 0.9,
+    "cash_deal_ratio": 0.5,
+    "cash_drop_pct": 50,
+    "top_n_per_hotel": 5
   },
   "hotels": {
     "DADHA": {"note": "岘港洲际"},
     "HKGKL": {"note": "香港金域假日"}
   },
   "clash": {
-    "api_url": "http://127.0.0.1:64821",   // Clash for Windows Settings 里的实际端口
+    "api_url": "http://127.0.0.1:64821",
     "secret": "secret",
     "proxy_group": "GLOBAL",
     "rotate_every_n": 5,

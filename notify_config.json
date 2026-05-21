@@ -1,15 +1,25 @@
 {
+  "_说明": "IHG 价格监控通知配置文件",
+
   "server_chan_key": "SCT350235TLGERB0nU0NYLf0DpqhyHDnDz",
-  "rules": {
-    "points_drop_pct": 40,
-    "cash_drop_pct": 40,
-    "new_date_below_avg_pct": 30,
-    "reopen_max_ratio": 0.9,
-    "cash_deal_ratio": 0.6,
-    "min_cpp_threshold": 0.6,
-    "top_n_per_hotel": 5,
-    "min_baseline_samples": 14
+
+  "_rules_说明": {
+    "min_cpp_threshold": "💎 高CPP积分房: CPP >= 此值触发 (0.7 = 每万分价值70元人民币)",
+    "points_drop_pct": "🔴 积分同日暴降: 同一日期积分降幅 >= 此百分比触发",
+    "holiday_points_ratio": "🟠 节假日积分低价: 节假日积分 <= 平日均价×此值触发 (0.9 = 低于均价10%)",
+    "cash_deal_ratio": "🟣 现金深折扣: 现金 <= 平日均价×此值触发 (0.5 = 半价以下)",
+    "cash_drop_pct": "🟡 现金同日暴降: 同一日期现金降幅 >= 此百分比触发",
+    "top_n_per_hotel": "每家酒店最多推送的高性价比条数, 按性价比从高到低排列"
   },
+  "rules": {
+    "min_cpp_threshold": 0.7,
+    "points_drop_pct": 40,
+    "holiday_points_ratio": 0.9,
+    "cash_deal_ratio": 0.5,
+    "cash_drop_pct": 50,
+    "top_n_per_hotel": 5
+  },
+
   "hotels": {
     "DADHA": {"note": "岘港洲际"},
     "HKGKL": {"note": "香港金域假日"},
@@ -17,6 +27,7 @@
     "HKGIN": {"note": "香港英迪格"},
     "PQCCP": {"note": "富国岛皇冠假日"}
   },
+
   "clash": {
     "api_url": "http://127.0.0.1:56285",
     "secret": "你的secret填这里",
