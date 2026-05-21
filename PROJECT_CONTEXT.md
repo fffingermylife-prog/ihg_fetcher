@@ -45,9 +45,26 @@
 - **5条告警规则**（按优先级从高到低, 条件极端避免噪音）:
   - 💎 高 CPP 积分房: CPP ≥ 0.8 (`min_cpp_threshold`) — **CPP 单位为 USD 美分/积分**, 0.8 表示每万积分价值 $80 以上
   - 🔴 积分同日暴降: 同日积分降幅 ≥ 40% (`points_drop_pct`) — 需历史基准
-  - 🟠 节假日积分低价: 节假日 + 积分 ≤ 平日均价×0.9 (`holiday_points_ratio`) — 无需历史
+  - 🟠 节假日积分低价: 节假日 + 积分 ≤ 本次平日均价×0.9 (`holiday_points_ratio`) — 无需历史
   - 🟣 现金深折扣: 现金 ≤ 平日均价×0.5 (`cash_deal_ratio`) — **均价比较用 USD, 跨币种可比**
   - 🟡 现金同日暴降: 同日现金降幅 ≥ 50% (`cash_drop_pct`) — 需历史基准
+- **权重评分系统** (✨ 新增):
+  - 5 种规则各自映射到 0~100 统一权重分
+  - 💎高CPP: 基础 60 分, CPP=2×阈值时 100 分
+  - 🟣现金深折扣: 基础 85 分 (50%折扣), 真金白银
+  - 🟠节假日积分: 基础 45 分 (低10%均价), 有旅行场景加成
+  - 🔴积分暴降: 基础 52 分 (40%降幅), 时效性机会
+  - 🟡现金暴降: 基础 45 分 (50%降幅), 时效性机会
+  - 所有酒店告警混在一起按权重降序排, 取全局 `top_n_global` (默认10) 推送
+- **推送格式精简** (✨ 解决 Server酱 1406 超长报错):
+  - 按酒店分组, 酒店名只出现一次 (纯名字, 无代码)
+  - 每条告警一行紧凑格式: `💎 2026-10-01 15000分 ≈$82 CPP=0.55¢ [预订](url)`
+  - 现金价格只显示 USD (不再双重显示本地币+USD)
+  - `send_server_chan` 加 30000 字符截断保护
+- **节假日逻辑优化** (✨ 减少噪音):
+  - 单天假期 (元旦/清明/端午/中秋): 仅当天算节假日, **不加前后2天缓冲**
+  - 长假 (春节/五一/国庆, ≥3天): 核心日期 + 前后各2天缓冲
+  - 避免把"6月1号前后普通工作日"误判为节假日触发大量告警
 - **货币统一为 USD** (✨ 新增):
   - IHG Calendar API 返回的是酒店本地币 (MYR/JPY/HKD 等)
   - 通过 IHG 官方汇率 API `apis.ihg.com/finance/conversions/v2/currencies` 转 USD
@@ -164,6 +181,7 @@
 | Clash 切换节点不生效 (API层面) | 用户在 Global 模式但代码切的是 Proxies 组 | 改成切 GLOBAL 组 + 加 only_flag_emoji 过滤 |
 | ~~Clash 切换后浏览器仍走旧节点~~ (旧版方案已废弃) | ~~Playwright 到代理的 TCP 持久连接 (Keep-Alive)~~ | ~~代数计数器 + 切换后 page.goto() 刷新页面~~ |
 | Clash 切换后 apis.ihg.com 仍走旧节点 (经实测) | `page.goto(SEED_URL)` 只对 www.ihg.com 触发 navigation, 但 (a) Chromium socket pool 是 per-host 的, apis.ihg.com 这条 HTTP/2 长连接根本不被触碰; (b) 即使是 www.ihg.com, 浏览器看到 idle keep-alive socket 也会**直接复用**而不重建。代数计数器方案完全无效。 | **重构为批次重建模式**: 每批 N 个酒店共享一个 BrowserContext, 批次间关 context 释放所有 socket → 切节点 → 重建 context, 流量真正走新节点。失败时 abort_event 立即中断当前批次, 未完成酒店放回队首在下批 (新节点) 重试 |
+| Server酱推送 1406 Data too long | 5家酒店 × 365天, 命中的节假日告警太多, 格式冗长, desp 超出 MySQL 字段限制 | 重构通知模块: (1) 精简格式 (酒店名只显示一次, 现金只显示USD); (2) 单天假期(元旦/清明/端午/中秋)不加缓冲天; (3) 引入权重评分系统全局 top 10 推送; (4) send_server_chan 加 30000 字符截断保护 |
 | 代理连通性测试 IHG 返回 403 | Akamai 反爬拦截 requests | 改用 Cloudflare 204 端点 (cp.cloudflare.com/generate_204) |
 | 报告含 2027-05-16 售罄(已过期) | compare_prices 没过滤过期日期 | 加 `today_str` 过滤 `[d for d in all_dates if d > today_str]` |
 | 通知基准均价不准 | `get_hotel_avg_*` 仅取 `load_latest_prices()` 一次快照 | 改用 `get_all_cash_prices/get_all_points_prices` 取所有历史快照, 不足14样本时 fallback 本次快照 |
@@ -339,5 +357,8 @@ https://www.ihg.com/redirect?path=rates&hotelCode=HKGKL&regionCode=1&localeCode=
 - 微信小程序跳转方案已放弃（无法程序生成），现在走 IHG 官网 redirect 链接，已验证可用
 - IHG redirect 链接关键参数: `adjustMonth=true` + `monthIndex=01`，否则月份会偏移+1
 - **Clash 节点切换 = 批次重建 BrowserContext** (✨ 关键): page.goto / CDP offline 等"轻量招"对 HTTP/2 keep-alive 长连接都无效, 唯一可靠方案是关闭整个 context 释放 socket 后再重建。具体: `ihg_batch_monitor.py` main 用 while 批次循环, 每批 `rotate_every_n` (默认 8) 个酒店共享一个 context, 批次间 close → rotate → relaunch
+- **经用户 Clash 日志验证**: 批次重建模式已确认生效 — 每批的 apis.ihg.com 流量确实走了当前节点; 手动切换测试也验证了 Clash 配置/规则层面无问题 (rule 为空, GLOBAL 模式)
+- **通知推送精简**: 全局权重排序 top 10, 格式紧凑 (酒店名一次, 现金只显示 USD), send_server_chan 加 30000 字符截断。如需调整推送条数, 改 `rules.top_n_global`
+- **节假日缓冲策略**: 单天假期 (元旦/清明/端午/中秋) 不加前后缓冲, 只有长假 (春节/五一/国庆 ≥3天) 加前后 2 天
 - **货币统一为 USD**：所有价格通过 IHG 官方汇率 API 换算为 USD 后再算 CPP，CPP 单位为 USD 美分/积分，阈值 0.8 = 每万积分换 $80 以上
 - **CPP 字段语义已变更**: 旧版 = 本地币×100/积分（受币种面值影响）, 新版 = USD美分/积分（全球可比）, 旧 DB 数据的 CPP 不可直接用于新版阈值比较
