@@ -4,20 +4,35 @@
   "server_chan_key": "SCT350235TLGERB0nU0NYLf0DpqhyHDnDz",
 
   "_rules_说明": {
-    "min_cpp_threshold": "💎 高CPP积分房: CPP >= 此值触发, 单位 USD美分/积分 (0.8 = 每万积分换 $80 以上的房, 极佳性价比)",
-    "points_drop_pct": "🔴 积分同日暴降: 同一日期积分降幅 >= 此百分比触发",
-    "holiday_points_ratio": "🟠 节假日积分低价: 节假日积分 <= 平日均价×此值触发 (0.9 = 低于均价10%)",
-    "cash_deal_ratio": "🟣 现金深折扣: 现金 <= 平日均价×此值触发 (0.5 = 半价以下)",
-    "cash_drop_pct": "🟡 现金同日暴降: 同一日期现金降幅 >= 此百分比触发",
-    "top_n_per_hotel": "每家酒店最多推送的高性价比条数, 按性价比从高到低排列"
+    "_三层阈值": "file 阈值 (xxx_threshold/xxx_ratio): 入全量文件 ihg_logs/alerts_*.md | push 阈值 (xxx_push): 推送 Server酱微信 | top_n_global: 全局取前 N 条推送",
+    "min_cpp_threshold": "💎 file: CPP >= 此值入文件 (USD美分/积分, 0.8 = 每万积分价值$80以上)",
+    "min_cpp_push": "💎 push: CPP >= 此值才推送 (1.0 = 每万积分价值$100以上)",
+    "points_deep_discount_ratio": "🟢 file: 积分 <= 平日均价×此值入文件 (0.5 = 五折以下, 任意日期)",
+    "points_deep_discount_push_ratio": "🟢 push: 积分 <= 平日均价×此值才推送 (0.4 = 四折以下, 平日积分bug价利器)",
+    "points_drop_pct": "🔴 file: 同日积分降幅 >= 此百分比入文件",
+    "points_drop_push_pct": "🔴 push: 同日积分降幅 >= 此百分比才推送",
+    "holiday_points_ratio": "🟠 file: 节假日积分 <= 平日均价×此值入文件",
+    "holiday_points_push_ratio": "🟠 push: 节假日积分 <= 平日均价×此值才推送 (0.7 = 比平日还便宜30%)",
+    "cash_deal_ratio": "🟣 file: 现金USD <= 平日均价×此值入文件 (0.5 = 半价)",
+    "cash_deal_push_ratio": "🟣 push: 现金USD <= 平日均价×此值才推送 (0.4 = 60%折扣)",
+    "cash_drop_pct": "🟡 file: 同日现金降幅 >= 此百分比入文件",
+    "cash_drop_push_pct": "🟡 push: 同日现金降幅 >= 此百分比才推送",
+    "top_n_global": "全局推送 top N 条 (按权重降序), 默认 30"
   },
   "rules": {
     "min_cpp_threshold": 0.8,
+    "min_cpp_push": 1.0,
+    "points_deep_discount_ratio": 0.5,
+    "points_deep_discount_push_ratio": 0.4,
     "points_drop_pct": 40,
+    "points_drop_push_pct": 50,
     "holiday_points_ratio": 0.9,
+    "holiday_points_push_ratio": 0.7,
     "cash_deal_ratio": 0.5,
+    "cash_deal_push_ratio": 0.4,
     "cash_drop_pct": 50,
-    "top_n_per_hotel": 5
+    "cash_drop_push_pct": 60,
+    "top_n_global": 30
   },
 
   "hotels": {
