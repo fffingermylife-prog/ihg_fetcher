@@ -14,10 +14,16 @@ IHG Clash 代理自动切换模块
             "api_url": "http://127.0.0.1:56285",
             "secret": "你的secret",
             "proxy_group": "Proxies",
-            "rotate_every_n": 5,
+            "rotate_every_n": 8,
             "exclude_keywords": ["Traffic", "Expire", "DIRECT", "REJECT"]
         }
     }
+
+设计说明:
+    本模块只负责"通知 Clash 切换节点"这一件事。
+    切换后必须由调用方 (主流程) 关闭并重建整个 BrowserContext, 否则 Playwright
+    到 Clash 代理的 HTTP/2 keep-alive 长连接会被复用 → 流量继续走旧节点。
+    详见 ihg_batch_monitor.py 的批次循环实现。
 
 用法:
     from ihg_clash_proxy import ClashProxyManager
@@ -106,10 +112,9 @@ class ClashProxyManager:
         # 状态
         self.available_nodes = []    # 可用节点列表
         self.current_node = None     # 当前选中节点
-        self.hotel_count = 0         # 已处理酒店计数
+        self.hotel_count = 0         # 已处理酒店计数 (供主流程参考, 不再触发自动切换)
         self.switch_count = 0        # 切换次数统计
         self.fail_count = 0          # 连续失败计数
-        self._switch_generation = 0  # 切换代数: 每次切换 +1, worker 用此判断是否需要刷新
 
         # 初始化: 获取可用节点列表
         self._refresh_nodes()
@@ -182,9 +187,14 @@ class ClashProxyManager:
 
     def _switch_to(self, node_name):
         """切换到指定节点, 同时切换所有相关代理组确保生效
-        
-        注意: 切换后需要调用方主动刷新浏览器页面 (navigate) 来断开旧 TCP 连接,
-        否则 Playwright 的持久连接会继续走旧节点。详见 on_switch_callback。
+
+        重要: 仅切换 Clash 路由表是不够的。Playwright 浏览器到 Clash 本地代理的
+        HTTP/2 keep-alive 长连接是 per-host (BrowserContext 级别) 的, 已建立的
+        连接不会因 Clash 切换而断开 — 新流量仍会走旧节点。
+
+        所以本模块只负责"通知 Clash 切换", 调用方 (主流程) 必须在切换前后关闭
+        并重建整个 BrowserContext, 才能让流量真正走到新节点。
+        参见 ihg_batch_monitor.py 的批次循环实现。
         """
         try:
             old = self.current_node
@@ -218,7 +228,6 @@ class ClashProxyManager:
             self.current_node = node_name
             self.switch_count += 1
             self.fail_count = 0  # 重置连续失败计数
-            self._switch_generation += 1  # 代数+1, 所有 worker 下次循环会感知到并刷新页面
             print(f"[Clash] 切换节点: {old} → {node_name} (第{self.switch_count}次)")
 
             # 3. 短暂等待 Clash 内部路由更新
@@ -245,30 +254,9 @@ class ClashProxyManager:
 
     # ============ 公开接口 ============
 
-    def needs_reconnect(self, worker_generation):
-        """检查该 worker 是否需要刷新浏览器连接
-        
-        基于代数计数器机制: 每次切换节点 _switch_generation +1,
-        每个 worker 各自记录已同步的代数, 不相等则说明有新切换需要刷新。
-        
-        Playwright 浏览器通过代理建立的 TCP 连接是持久的 (HTTP/2 Keep-Alive),
-        Clash 切换节点只影响新连接, 已有连接仍走旧节点。
-        所以切换后必须让浏览器重新导航 (navigate) 来强制断开旧连接、建立新连接。
-        
-        Args:
-            worker_generation: 该 worker 上次同步时的代数
-        Returns: True 需要刷新, False 不需要
-        """
-        return worker_generation < self._switch_generation
-
-    @property
-    def generation(self):
-        """获取当前切换代数, worker 用此记录自己已同步到哪一代"""
-        return self._switch_generation
-
     def rotate(self):
         """
-        定期轮换: 随机切换到另一个节点
+        随机切换到另一个节点
         Returns: True 切换成功, False 切换失败或无可用节点
         """
         node = self._pick_random_node(exclude_current=True)
@@ -279,27 +267,24 @@ class ClashProxyManager:
 
     def on_hotel_done(self):
         """
-        每完成一个酒店后调用, 达到 rotate_every_n 时自动切换
-        Returns: True 如果触发了切换, False 如果未触发
+        每完成一个酒店后调用 (仅做计数, 不再触发自动切换)
+
+        在批次重建模式下, 节点切换由主流程在批次边界统一控制
+        (一个批次 = 一个 BrowserContext = 一个节点), 不再每 N 个酒店内部切换。
+        本方法保留只是为了兼容性和可观测统计。
         """
         self.hotel_count += 1
-        if self.hotel_count >= self.rotate_every_n:
-            self.hotel_count = 0
-            return self.rotate()
         return False
 
     def on_failure(self):
         """
-        请求失败时调用, 立即切换节点
-        Returns: True 切换成功, False 切换失败
+        请求失败时调用 (仅记录失败次数, 不再立即切换节点)
+
+        在批次重建模式下, 失败由主流程通过 abort_event 触发批次中断 →
+        关 context → 切节点 → 重建 context, 而不是在 worker 内直接切换。
         """
         self.fail_count += 1
-        print(f"[Clash] 检测到失败 (连续第{self.fail_count}次), 切换节点...")
-        # 等待一小段时间让新节点生效
-        success = self.rotate()
-        if success:
-            time.sleep(1)  # 给 Clash 切换时间
-        return success
+        return False
 
     def get_current(self):
         """获取当前节点名"""

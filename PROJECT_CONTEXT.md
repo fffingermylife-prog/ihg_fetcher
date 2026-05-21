@@ -67,17 +67,18 @@
 
 ### 5. Clash 代理自动切换 (`ihg_clash_proxy.py`)
 - 通过 Clash RESTful API 自动切换节点
-- 定期轮换：每处理 N 个酒店随机切换节点（默认 5）
-- 失败切换：请求失败/超时时立即切换
+- **批次重建模式** (✨ 重要更新):
+  - 每批 N 个酒店共享一个 BrowserContext + 一个 Clash 节点
+  - 一批结束后: 关 context (释放所有 socket) → 切节点 → 重建 context → 跑下一批
+  - 同批内任一酒店失败 → 触发 abort_event → 整批中断 → 未完成酒店放回队首 → 下批新节点重试
+  - 跨批次最多重试 3 次, 仍失败则放弃 (避免无限循环)
+- 失败切换：请求失败/超时时立即触发 abort, 主流程关 context + 切节点 + 重建
 - **only_flag_emoji 模式**: 只保留以国旗 emoji 开头的节点（U+1F1E6 ~ U+1F1FF），自动排除应用分组 (YouTube/Disney/Final/HK/JP 等)
 - **secret 自动清理**: 剔除非 ASCII 字符（避免 latin-1 编码错误），中文引号去除
 - **URL 编码分组名**: 用 `urllib.parse.quote` 处理 emoji/中文分组名
 - 启动前测试代理连通性（用 `cp.cloudflare.com/generate_204`，**不能用 IHG 测**因为会被 Akamai 反爬拦截返回 403）
-- **✨ 代数计数器机制**: 解决 Playwright 持久连接导致切换节点后流量仍走旧节点的问题
-  - 每次切换 `_switch_generation` +1，worker 检测代数变化后自动 `page.goto()` 刷新页面
-  - 多 Worker 并发安全：每个 Worker 独立记录自己的代数
 - 独立运行: `--test` / `--list` / `--current` / `--switch` / `--rotate`
-- 配置在 `notify_config.json` 的 `clash` 字段
+- 配置在 `notify_config.json` 的 `clash` 字段, `rotate_every_n` 默认 8 (批次大小)
 
 ### 6. 新日期开放时间探测 (`ihg_detect_open_time.py`)
 - 定时启动 (默认 00:59, 支持 `--start-time` 自定义)
@@ -120,7 +121,7 @@
 | 浏览器内并发 | 同一 page 的 6 个 fetch 并发会被 Akamai 限流，**不可行** |
 | Clash 代理 | 通过 `--proxy http://127.0.0.1:7890` 走 Clash，已验证可用 |
 | Clash for Windows API | external-controller 端口在客户端 Settings 中查看（不是 config.yaml 里的） |
-| Playwright 持久连接 | 浏览器到 Clash 本地代理的 TCP 连接是 Keep-Alive 的，切节点只对新连接生效，需 page.goto() 强制断开旧连接 |
+| Playwright 持久连接 | 浏览器到 Clash 本地代理是 per-host HTTP/2 keep-alive 长连接, page.goto 会复用 idle socket 不会重建。**唯一可靠的切换方式: 关闭整个 BrowserContext 重建** |
 | 货币转换 API | `apis.ihg.com/finance/conversions/v2/currencies?qFcc=XXX&qTcc=USD&qV=1` 返回 1单位本地币=N USD, 用此API统一货币 |
 | Calendar API 货币 | API 永远返回酒店本地币 (`propertyCurrency`/`lowestRate.currency`), 即使 url 是 `/us/en/`, 需自行调用转换 API |
 
@@ -161,7 +162,8 @@
 | 浏览器内 6 请求并发卡死 | Akamai 限流同 session 并发 | 回退为串行请求 |
 | Clash secret 含中文导致 latin-1 错误 | HTTP 头不允许非 ASCII | `_sanitize_secret` 自动剔除非 ASCII 字符 |
 | Clash 切换节点不生效 (API层面) | 用户在 Global 模式但代码切的是 Proxies 组 | 改成切 GLOBAL 组 + 加 only_flag_emoji 过滤 |
-| Clash 切换后浏览器仍走旧节点 | Playwright 到代理的 TCP 持久连接 (Keep-Alive) 不受 Clash 路由更新影响 | 代数计数器 + 切换后 page.goto() 刷新页面断开旧连接池 |
+| ~~Clash 切换后浏览器仍走旧节点~~ (旧版方案已废弃) | ~~Playwright 到代理的 TCP 持久连接 (Keep-Alive)~~ | ~~代数计数器 + 切换后 page.goto() 刷新页面~~ |
+| Clash 切换后 apis.ihg.com 仍走旧节点 (经实测) | `page.goto(SEED_URL)` 只对 www.ihg.com 触发 navigation, 但 (a) Chromium socket pool 是 per-host 的, apis.ihg.com 这条 HTTP/2 长连接根本不被触碰; (b) 即使是 www.ihg.com, 浏览器看到 idle keep-alive socket 也会**直接复用**而不重建。代数计数器方案完全无效。 | **重构为批次重建模式**: 每批 N 个酒店共享一个 BrowserContext, 批次间关 context 释放所有 socket → 切节点 → 重建 context, 流量真正走新节点。失败时 abort_event 立即中断当前批次, 未完成酒店放回队首在下批 (新节点) 重试 |
 | 代理连通性测试 IHG 返回 403 | Akamai 反爬拦截 requests | 改用 Cloudflare 204 端点 (cp.cloudflare.com/generate_204) |
 | 报告含 2027-05-16 售罄(已过期) | compare_prices 没过滤过期日期 | 加 `today_str` 过滤 `[d for d in all_dates if d > today_str]` |
 | 通知基准均价不准 | `get_hotel_avg_*` 仅取 `load_latest_prices()` 一次快照 | 改用 `get_all_cash_prices/get_all_points_prices` 取所有历史快照, 不足14样本时 fallback 本次快照 |
@@ -220,7 +222,7 @@ fffingermylife-prog/ihg_fetcher (分支: feat/ihg-calendar-price)
     "api_url": "http://127.0.0.1:64821",
     "secret": "secret",
     "proxy_group": "GLOBAL",
-    "rotate_every_n": 5,
+    "rotate_every_n": 8,
     "only_flag_emoji": true,
     "exclude_keywords": ["Traffic","Expire","DIRECT","REJECT","GLOBAL","Proxies","Final"]
   }
@@ -336,6 +338,6 @@ https://www.ihg.com/redirect?path=rates&hotelCode=HKGKL&regionCode=1&localeCode=
 - `notify_config.json` 的 `clash.proxy_group` 必须和用户实际使用的模式匹配（Global → "GLOBAL"，Rule → 实际生效的分组名）
 - 微信小程序跳转方案已放弃（无法程序生成），现在走 IHG 官网 redirect 链接，已验证可用
 - IHG redirect 链接关键参数: `adjustMonth=true` + `monthIndex=01`，否则月份会偏移+1
-- Playwright 持久连接问题已解决：切换 Clash 节点后必须 page.goto() 刷新页面，否则旧 TCP 连接仍走原节点（代数计数器机制）
+- **Clash 节点切换 = 批次重建 BrowserContext** (✨ 关键): page.goto / CDP offline 等"轻量招"对 HTTP/2 keep-alive 长连接都无效, 唯一可靠方案是关闭整个 context 释放 socket 后再重建。具体: `ihg_batch_monitor.py` main 用 while 批次循环, 每批 `rotate_every_n` (默认 8) 个酒店共享一个 context, 批次间 close → rotate → relaunch
 - **货币统一为 USD**：所有价格通过 IHG 官方汇率 API 换算为 USD 后再算 CPP，CPP 单位为 USD 美分/积分，阈值 0.8 = 每万积分换 $80 以上
 - **CPP 字段语义已变更**: 旧版 = 本地币×100/积分（受币种面值影响）, 新版 = USD美分/积分（全球可比）, 旧 DB 数据的 CPP 不可直接用于新版阈值比较

@@ -596,104 +596,189 @@ def save_prices(hotel_code, prices, days_queried):
 
 # ============ 并发 Worker ============
 
-async def worker(worker_id, page, task_queue, results, windows, dry_run, clash_mgr=None):
-    """并发 worker: 从队列取酒店代码, 获取价格, 对比变化"""
-    # 每个 worker 记录自己已同步到的 Clash 切换代数
-    my_generation = clash_mgr.generation if clash_mgr else 0
+async def worker(worker_id, page, batch_queue, results, requeue, windows, dry_run, abort_event):
+    """并发 worker (批次模式): 从批次队列取酒店, 跑完即写入 results;
+    任何失败立即触发 abort_event 通知主流程关 context 重建。
 
+    Args:
+        batch_queue: 仅含本批次酒店的 asyncio.Queue, 元素 (idx, code, total)
+        results: 成功结果会 append 到这个 list (主流程共享)
+        requeue: 失败/未完成的酒店 code 会 append 到这个 list, 主流程下批重试
+        abort_event: 任一 worker 检测到失败 → set; 其他 worker 跑完手头任务即退出
+    """
     while True:
+        # 1. 检查批次是否已被通知中止
+        if abort_event.is_set():
+            return
+
+        # 2. 从队列取一个酒店任务
         try:
-            idx, hotel_code, total_count = task_queue.get_nowait()
+            idx, hotel_code, total_count = batch_queue.get_nowait()
         except asyncio.QueueEmpty:
-            break
+            return
 
-        # Clash: 如果切换了节点 (代数变了), 需要刷新页面断开旧 TCP 连接
-        # 原理: Playwright 浏览器到 Clash 代理的 TCP 连接是持久的 (Keep-Alive),
-        #        Clash 切节点只对新连接生效, 旧连接仍走原节点。
-        #        通过 page.goto() 重新导航, 浏览器会关闭旧连接池、建立新连接。
-        if clash_mgr and clash_mgr.needs_reconnect(my_generation):
-            try:
-                await page.goto(SEED_URL, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(random.randint(1000, 2000))
-                my_generation = clash_mgr.generation  # 同步到最新代数
-                print(f"  [W{worker_id}] 页面已刷新, 新连接走节点: {clash_mgr.current_node} ✓")
-            except Exception as e:
-                print(f"  [W{worker_id}] 刷新页面失败: {str(e)[:60]}, 继续...")
-                my_generation = clash_mgr.generation  # 即使失败也同步, 避免反复重试
-
-        # 酒店带名称的显示标签 (如 "HKGKL (香港金域假日)")
         label = format_hotel_label(hotel_code)
-
         t0 = time.time()
         success = False
+        prices = None
         retries = 0
 
-        while retries <= MAX_RETRIES:
+        # 3. 单酒店整体超时 120 秒 (正常 6~8 秒), 失败重试 MAX_RETRIES 次
+        #    用 try-finally 保证: 即使 worker 中途被外部 cancel, 也能把任务放回 requeue
+        completed = False
+        try:
+            while retries <= MAX_RETRIES:
+                try:
+                    prices = await asyncio.wait_for(
+                        fetch_hotel_prices(page, hotel_code, windows),
+                        timeout=120
+                    )
+                    success = True
+                    break
+                except asyncio.TimeoutError:
+                    retries += 1
+                    if retries <= MAX_RETRIES:
+                        print(f"  [W{worker_id}] {label} 超时, 重试 ({retries}/{MAX_RETRIES})...")
+                        await page.wait_for_timeout(random.randint(3000, 5000))
+                    else:
+                        print(f"  [W{worker_id}] {label} 超时, 触发批次重建")
+                except Exception as e:
+                    retries += 1
+                    if retries <= MAX_RETRIES:
+                        print(f"  [W{worker_id}] {label} 失败, 重试 ({retries}/{MAX_RETRIES})...")
+                        await page.wait_for_timeout(random.randint(2000, 4000))
+                    else:
+                        print(f"  [W{worker_id}] {label} 失败, 触发批次重建: {str(e)[:100]}")
+
+            elapsed = time.time() - t0
+
+            if success and prices:
+                # 加载基线对比 (old_date 用于报告中说明对比基准)
+                old_prices, old_date = load_baseline(hotel_code)
+                changes = []
+                if old_prices:
+                    changes = compare_prices(old_prices, prices)
+
+                # 保存最新数据
+                if not dry_run:
+                    save_prices(hotel_code, prices, len(windows) * WINDOW_SIZE_DAYS)
+
+                results.append({
+                    "hotel_code": hotel_code,
+                    "success": True,
+                    "days": len(prices),
+                    "changes": changes,
+                    "elapsed": elapsed,
+                    "is_first_run": not bool(old_prices),
+                    "baseline_date": old_date,
+                    "prices": prices,
+                })
+                status = "首次" if not old_prices else f"{len(changes)}变化"
+                print(f"  [{idx}/{total_count}] {label} ✓ {elapsed:.1f}s ({len(prices)}天, {status})")
+                completed = True
+            else:
+                # 失败: 放回 requeue 让下个批次 (新节点) 重试, 并触发整批中止
+                requeue.append(hotel_code)
+                abort_event.set()
+                print(f"  [{idx}/{total_count}] {label} ✗ {elapsed:.1f}s (失败, 已触发批次重建)")
+                completed = True
+        finally:
+            # 兜底: 如果 worker 被外部 cancel 或抛出未捕获异常,
+            # 当前任务也要放回 requeue, 避免酒店被吞掉
+            if not completed:
+                requeue.append(hotel_code)
+                abort_event.set()
+
+
+async def run_batch(playwright, batch_codes, total_index_map, concurrency, windows,
+                    dry_run, launch_opts):
+    """跑一个批次: 启动新 BrowserContext → 多 worker 并发 → 关 context
+
+    重要: 每个批次绑定一个 Clash 节点。本函数生命周期内 context 全程使用同一个
+    出口节点; 关闭 context 后所有 socket 释放, 主流程切换节点再重建 context,
+    才能保证下一批流量真正走到新节点 (解决 Playwright 持久连接复用旧节点问题)。
+
+    Args:
+        playwright: 当前 async_playwright 实例
+        batch_codes: 这一批要跑的酒店代码列表
+        total_index_map: dict[code -> (idx, total)] 用于显示全局进度 "X/Y"
+        concurrency: 本批并发 Tab 数
+        windows: 日期窗口列表
+        dry_run: 是否跳过持久化
+        launch_opts: launch_persistent_context 参数 (含 proxy)
+
+    Returns:
+        (results, requeue):
+            results - 本批跑成功的酒店结果 list
+            requeue - 因失败/abort 未完成的酒店 code list (含失败那个 + 队列剩余)
+    """
+    Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
+
+    results = []
+    requeue = []
+    abort_event = asyncio.Event()
+
+    # 1. 启动 context (新节点的连接池从这里开始)
+    context = await playwright.chromium.launch_persistent_context(
+        USER_DATA_DIR,
+        **launch_opts,
+    )
+    await context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+    )
+
+    try:
+        # 2. 创建 page (Tab) 并逐个建立 session (避免同时 goto 触发 Akamai)
+        pages = []
+        session_ok = True
+        for i in range(concurrency):
+            page = await context.new_page()
+            pages.append(page)
+
+        for i, page in enumerate(pages):
             try:
-                # 单酒店整体超时 120 秒 (正常约 6~8 秒)
-                prices = await asyncio.wait_for(
-                    fetch_hotel_prices(page, hotel_code, windows),
-                    timeout=120
-                )
-                success = True
-                break
-            except asyncio.TimeoutError:
-                retries += 1
-                if retries <= MAX_RETRIES:
-                    print(f"  [W{worker_id}] {label} 超时, 重试 ({retries}/{MAX_RETRIES})...")
-                    await page.wait_for_timeout(random.randint(3000, 5000))
-                else:
-                    print(f"  [W{worker_id}] {label} 超时, 跳过")
+                await page.goto(SEED_URL, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(random.randint(1000, 2000))
+                print(f"    Tab {i+1} session 就绪 ✓")
             except Exception as e:
-                retries += 1
-                if retries <= MAX_RETRIES:
-                    print(f"  [W{worker_id}] {label} 失败, 重试 ({retries}/{MAX_RETRIES})...")
-                    await page.wait_for_timeout(random.randint(2000, 4000))
-                else:
-                    print(f"  [W{worker_id}] {label} 失败, 跳过: {str(e)[:100]}")
+                print(f"    Tab {i+1} session 建立失败: {str(e)[:80]}")
+                session_ok = False
+                break
 
-        elapsed = time.time() - t0
+        if not session_ok:
+            # session 阶段就失败 → 整批 requeue, 主流程切节点重试
+            requeue.extend(batch_codes)
+            return results, requeue
 
-        if success and prices:
-            # 加载基线对比 (old_date 是上次采集的时间, 用于在报告中说明对比基准)
-            old_prices, old_date = load_baseline(hotel_code)
-            changes = []
+        # 3. 准备批次队列
+        batch_queue = asyncio.Queue()
+        for code in batch_codes:
+            idx, total = total_index_map.get(code, (0, len(batch_codes)))
+            batch_queue.put_nowait((idx, code, total))
 
-            if old_prices:
-                changes = compare_prices(old_prices, prices)
+        # 4. 启动并发 worker
+        worker_tasks = [
+            worker(i + 1, page, batch_queue, results, requeue, windows, dry_run, abort_event)
+            for i, page in enumerate(pages)
+        ]
+        await asyncio.gather(*worker_tasks)
 
-            # 保存最新数据
-            if not dry_run:
-                save_prices(hotel_code, prices, len(windows) * WINDOW_SIZE_DAYS)
+        # 5. abort 时队列里可能还有未取走的酒店, 也放回 requeue
+        while not batch_queue.empty():
+            try:
+                _, code, _ = batch_queue.get_nowait()
+                if code not in requeue:  # 防御性去重
+                    requeue.append(code)
+            except asyncio.QueueEmpty:
+                break
+    finally:
+        # 关闭 context: 释放所有 socket, 下批重建后才会建立新连接到新节点
+        try:
+            await context.close()
+        except Exception as e:
+            print(f"    [!] 关闭 context 异常 (忽略): {str(e)[:80]}")
 
-            results.append({
-                "hotel_code": hotel_code,
-                "success": True,
-                "days": len(prices),
-                "changes": changes,
-                "elapsed": elapsed,
-                "is_first_run": not bool(old_prices),
-                "baseline_date": old_date,  # 上次采集时间, 用于报告对比基准
-                "prices": prices,  # 本次快照, 供 notify 模块做高性价比扫描
-            })
-            status = "首次" if not old_prices else f"{len(changes)}变化"
-            print(f"  [{idx}/{total_count}] {label} ✓ {elapsed:.1f}s ({len(prices)}天, {status})")
-
-            # Clash: 每完成一个酒店, 检查是否需要轮换节点
-            if clash_mgr:
-                clash_mgr.on_hotel_done()
-        else:
-            results.append({
-                "hotel_code": hotel_code,
-                "success": False,
-                "elapsed": elapsed,
-                "changes": [],
-            })
-            print(f"  [{idx}/{total_count}] {label} ✗ {elapsed:.1f}s (失败)")
-
-            # Clash: 失败时立即切换节点
-            if clash_mgr:
-                clash_mgr.on_failure()
+    return results, requeue
 
 
 # ============ 报告输出 ============
@@ -987,19 +1072,34 @@ async def main():
         windows = iter_date_windows(start, args.days, WINDOW_SIZE_DAYS)
         mode_str = "全量"
 
+    # 批次大小: 启用 Clash 时按 rotate_every_n 切批, 否则一批跑完
+    if clash_mgr:
+        batch_size = max(1, clash_mgr.rotate_every_n)
+    else:
+        batch_size = max(1, len(hotel_codes))
+
+    est_batches = (len(hotel_codes) + batch_size - 1) // batch_size
+
     print("=" * 80)
     print(f"  IHG 批量价格监控")
     print(f"  模式: {mode_str} | 并发: {concurrency} Tab | 酒店: {len(hotel_codes)} 个")
     print(f"  日期: {windows[0][0]} ~ {windows[-1][1]} ({len(windows)} 个窗口)")
     print(f"  每酒店请求: 现金 {len(windows)} 次 + 积分 {len(windows)} 次")
-    est_time = len(hotel_codes) * len(windows) * 2 * (sum(REQUEST_DELAY_MS) / 2 / 1000) / concurrency
+    if clash_mgr:
+        print(f"  批次模式: 每批 {batch_size} 个酒店 → 关 context + 切节点 + 重建 (估 {est_batches} 批)")
+    else:
+        print(f"  单批模式: 直连无切换")
+    # 预估耗时: 抓取耗时 + 每批重建 context 约 8 秒开销
+    est_fetch = len(hotel_codes) * len(windows) * 2 * (sum(REQUEST_DELAY_MS) / 2 / 1000) / concurrency
+    est_overhead = est_batches * 8 if clash_mgr else 0
+    est_time = est_fetch + est_overhead
     print(f"  预估耗时: ~{est_time:.0f}s ({est_time/60:.1f}min)")
     if args.dry_run:
         print(f"  [dry-run 模式, 不保存数据]")
     if args.proxy:
         print(f"  代理: {args.proxy}")
     if clash_mgr:
-        print(f"  Clash自动切换: ✓ (每{clash_mgr.rotate_every_n}个酒店轮换)")
+        print(f"  Clash当前节点: {clash_mgr.current_node}")
     print("=" * 80)
 
     # 启动前检测: 代理连通性验证
@@ -1057,68 +1157,110 @@ async def main():
                 print(f"[!] 退出. 请确认代理正常后重新运行.")
                 return
 
-    # 创建任务队列
-    task_queue = asyncio.Queue()
-    for idx, code in enumerate(hotel_codes, 1):
-        task_queue.put_nowait((idx, code, len(hotel_codes)))
+    # ============ 批次循环 ============
+    # 每批: 启动新 context (绑定当前节点) → 跑 N 个酒店 → 关 context → 切节点 → 下一批
+    # 同一批内任一失败 → abort 整批 → 未完成酒店放回队首, 下批 (新节点) 重试
 
+    # 全局索引映射 (按初始顺序固定, 重试时显示同一个 idx)
+    total_index_map = {code: (idx, len(hotel_codes)) for idx, code in enumerate(hotel_codes, 1)}
+
+    # 跨批次尝试计数 (避免一个酒店被反复重试无限循环)
+    MAX_BATCH_ATTEMPTS = 3
+    attempt_count = {code: 0 for code in hotel_codes}
+    abandoned = []   # 超过 MAX_BATCH_ATTEMPTS 后放弃的酒店
+
+    # 构建 launch 参数 (每批用同一份, 但 context 每批新建)
+    launch_opts = {
+        "headless": False,
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+        "viewport": {"width": 1280, "height": 900},
+        "locale": "en-US",
+        "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+    }
+    if args.proxy:
+        launch_opts["proxy"] = {"server": args.proxy}
+
+    remaining = list(hotel_codes)
     results = []
-
-    Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
+    batch_num = 0
 
     async with async_playwright() as p:
-        # 构建启动参数
-        launch_opts = {
-            "headless": False,
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-            "viewport": {"width": 1280, "height": 900},
-            "locale": "en-US",
-            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        }
-        if args.proxy:
-            launch_opts["proxy"] = {"server": args.proxy}
+        t_start = time.time()
 
-        context = await p.chromium.launch_persistent_context(
-            USER_DATA_DIR,
-            **launch_opts,
-        )
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-        )
+        while remaining:
+            batch_num += 1
 
-        # 创建多个 page (Tab)
-        pages = []
-        for i in range(concurrency):
-            page = await context.new_page()
-            pages.append(page)
+            # 取一批: 跳过已超过最大尝试次数的酒店
+            batch = []
+            new_remaining = []
+            for code in remaining:
+                if len(batch) < batch_size:
+                    if attempt_count[code] >= MAX_BATCH_ATTEMPTS:
+                        if code not in abandoned:
+                            abandoned.append(code)
+                        continue
+                    batch.append(code)
+                    attempt_count[code] += 1
+                else:
+                    new_remaining.append(code)
+            remaining = new_remaining
 
-        try:
-            # 逐个 Tab 建立 session (避免同时 goto 触发 Akamai)
-            print(f"\n[1] 建立浏览器 session ({concurrency} 个 Tab)...")
-            for i, page in enumerate(pages):
-                await page.goto(SEED_URL, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(random.randint(1000, 2000))
-                print(f"    Tab {i+1} ✓")
-            await pages[0].wait_for_timeout(random.randint(500, 1000))
-            print("    全部就绪")
+            if not batch:
+                continue
 
-            # 启动并发 worker
-            print(f"\n[2] 开始获取价格...")
-            t_start = time.time()
+            node_label = clash_mgr.current_node if clash_mgr else "直连"
+            print(f"\n{'─'*80}")
+            print(f"[批次 {batch_num}] 节点: {node_label} | 本批 {len(batch)} 个 | 待跑剩余 {len(remaining)} 个")
+            print(f"  酒店: {', '.join(batch)}")
+            print(f"{'─'*80}")
 
-            worker_tasks = []
-            for i, page in enumerate(pages):
-                worker_tasks.append(
-                    worker(i + 1, page, task_queue, results, windows, args.dry_run, clash_mgr)
+            t_batch = time.time()
+            try:
+                batch_results, batch_requeue = await run_batch(
+                    p, batch, total_index_map, concurrency, windows,
+                    args.dry_run, launch_opts,
                 )
-            await asyncio.gather(*worker_tasks)
+            except Exception as e:
+                # run_batch 自身崩溃 (极少): 整批 requeue, 切节点重试
+                print(f"[批次 {batch_num}] run_batch 异常: {str(e)[:120]}")
+                batch_results = []
+                batch_requeue = list(batch)
 
-            total_time = time.time() - t_start
-            print(f"\n[3] 全部完成, 总耗时: {total_time:.1f}s")
+            results.extend(batch_results)
+            batch_elapsed = time.time() - t_batch
 
-        finally:
-            await context.close()
+            # 失败/未完成的放回队首 (优先在下个批次/新节点重试)
+            if batch_requeue:
+                # 去重防御 (同一 code 不会同时出现在 results 和 requeue, 但保险一下)
+                seen_in_results = {r["hotel_code"] for r in batch_results}
+                actually_requeue = [c for c in batch_requeue if c not in seen_in_results]
+                remaining = actually_requeue + remaining
+                print(f"[批次 {batch_num}] 完成 {len(batch_results)}/{len(batch)} | "
+                      f"放回 {len(actually_requeue)} 个待重试 | 耗时 {batch_elapsed:.1f}s")
+            else:
+                print(f"[批次 {batch_num}] 完成 ✓ {len(batch_results)}/{len(batch)} | 耗时 {batch_elapsed:.1f}s")
+
+            # 如果还有酒店要跑, 切换节点准备下一批
+            if remaining and clash_mgr:
+                print(f"[批次 {batch_num}] 切换 Clash 节点准备下一批...")
+                clash_mgr.rotate()
+                await asyncio.sleep(2)  # 给 Clash 路由表更新时间
+
+        total_time = time.time() - t_start
+        print(f"\n[完成] 共 {batch_num} 批, 总耗时: {total_time:.1f}s")
+
+    # 标记被放弃的酒店 (放进 results 让报告里看到)
+    for code in abandoned:
+        results.append({
+            "hotel_code": code,
+            "success": False,
+            "elapsed": 0,
+            "changes": [],
+            "abandoned": True,
+        })
+    if abandoned:
+        print(f"[!] {len(abandoned)} 个酒店超过 {MAX_BATCH_ATTEMPTS} 次重试仍失败, 已放弃: {', '.join(abandoned)}")
 
     # 输出报告
     print_report(results)

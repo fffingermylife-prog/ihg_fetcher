@@ -29,10 +29,11 @@
   },
 
   "clash": {
+    "_说明": "rotate_every_n 在批次重建模式下表示『每批多少个酒店』, 一批结束后会关 context + 切节点 + 重建; 数值越大切换次数越少, 但单批失败影响面越大",
     "api_url": "http://127.0.0.1:56285",
     "secret": "你的secret填这里",
     "proxy_group": "GLOBAL",
-    "rotate_every_n": 5,
+    "rotate_every_n": 8,
     "only_flag_emoji": true,
     "exclude_keywords": [
       "Traffic", "Expire", "DIRECT", "REJECT",
