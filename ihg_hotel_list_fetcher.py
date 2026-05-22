@@ -452,6 +452,11 @@ async def main():
 
                 if not target_link:
                     print(f"\n    [!] 未匹配 '{target_name}', 跳过")
+                    print(f"    可用选项 ({len(region_links)} 个), 请用 --target 选择其中一个文本:")
+                    for lk in region_links[:50]:
+                        print(f"      - {lk['text']}")
+                    if len(region_links) > 50:
+                        print(f"      ... (还有 {len(region_links) - 50} 个未显示)")
                     continue
 
                 target_url = target_link["href"]
