@@ -446,7 +446,7 @@ def _write_all_alerts_file(all_alerts):
             lines.append(f"## {group['label']} ({len(group['items'])}条)\n")
             for a in group["items"]:
                 url = build_booking_url(code, a["date"])
-                lines.append(f"- {a['level']} `{a['date']}` W={a['weight']:.0f} | {a['detail']} [预订]({url})")
+                lines.append(f"- {a['level']} **{a['type']}** `{a['date']}` W={a['weight']:.0f} | {a['detail']} [预订]({url})")
             lines.append("")
 
         lines.append(f"\n---\n共 {len(all_alerts)} 条告警, {len(hotel_groups)} 家酒店")
@@ -494,7 +494,7 @@ def format_message(alerts):
         lines.append(f"### {group['label']}\n")
         for a in group["items"]:
             url = build_booking_url(code, a["date"])
-            lines.append(f"- {a['level']} `{a['date']}` {a['detail']} [预订]({url})")
+            lines.append(f"- {a['level']} **{a['type']}** `{a['date']}` {a['detail']} [预订]({url})")
         lines.append("")
 
     lines.append(f"---\n*权重排序, 共{len(alerts)}条*")
@@ -553,7 +553,7 @@ def notify_changes(results, db):
     print(f"  📢 {title}")
     print(f"{'='*60}")
     for a in alerts:
-        print(f"  {a['level']} [{a['label']}] {a['date']} {a['detail']} (W={a['weight']:.0f})")
+        print(f"  {a['level']} [{a['type']}] [{a['label']}] {a['date']} {a['detail']} (W={a['weight']:.0f})")
     print(f"{'='*60}")
 
     send_server_chan(title, body, config.get("server_chan_key", ""))
