@@ -5,6 +5,10 @@ IHG 酒店列表抓取工具 - 按国家/地区收集酒店信息
 功能:
     - 通过 --target 指定要抓取的国家/地区 (支持多个, 逗号分隔)
     - 通过 --region 指定大区域 (默认 Asia)
+    - 自动识别二级链接是 "国家级" 还是 "州/省级"
+        * 国家级 (Asia/Europe/...): "Vietnam Hotels" → country="Vietnam"
+        * 州/省级 (US & Canada):    "Alabama Hotels" → country="United States"
+                                      "Ontario Hotels" → country="Canada"
     - 自动展开子区域递归收集 (Hotels by State/Region)
     - 增量去重: 如果输出文件已存在, 自动加载已有数据, 只追加新酒店
     - 结果按国家分组, 每个国家内按评分从高到低排序
@@ -20,8 +24,14 @@ IHG 酒店列表抓取工具 - 按国家/地区收集酒店信息
     # 抓取欧洲的法国
     python ihg_hotel_list_fetcher.py --region "Europe" --target "France Hotels"
 
+    # 抓取整个美加 (会按州/省抓, 自动归并到 United States / Canada)
+    python ihg_hotel_list_fetcher.py --region "US & Canada"
+
     # 指定输出文件名
     python ihg_hotel_list_fetcher.py --target "Japan Hotels" --output japan_hotels.csv
+
+    # 仅修正数据库里已存在的 美国州/加拿大省 误记的 country 字段 (一次性迁移)
+    python ihg_hotel_list_fetcher.py --fix-country
 """
 
 import argparse
@@ -39,6 +49,49 @@ from playwright.async_api import async_playwright
 EXPLORE_URL = "https://www.ihg.com/explore"
 USER_DATA_DIR = "./ihg_browser_profile"
 DEFAULT_OUTPUT = "ihg_hotels.csv"
+
+
+# ============ 国家归一化 ============
+# IHG 的 "US & Canada" 大区域展开后, 二级链接直接是州/省级 (跳过了国家层),
+# 这里把州/省名映射回所属国家, 避免 country 字段被误存为州/省名.
+
+US_STATES = {
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+    "Connecticut", "Delaware", "District of Columbia", "Florida", "Georgia",
+    "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky",
+    "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+    "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire",
+    "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota",
+    "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island",
+    "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont",
+    "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming",
+}
+
+CA_PROVINCES = {
+    "Alberta", "British Columbia", "Manitoba", "New Brunswick",
+    "Newfoundland and Labrador", "Nova Scotia", "Ontario",
+    "Prince Edward Island", "Quebec", "Saskatchewan",
+    "Northwest Territories", "Nunavut", "Yukon",
+}
+
+
+def resolve_country(link_text):
+    """从二级链接文字推断真实国家名.
+
+    覆盖两种 IHG 区域展开模式:
+      1) 国家级 (Asia/Europe/...):  "France Hotels"  → "France"
+      2) 州/省级 (US & Canada):     "Alabama Hotels" → "United States"
+                                     "Ontario Hotels" → "Canada"
+
+    注: 美国领土 (Puerto Rico/Guam/U.S. Virgin Islands 等) 保持原文,
+        不强行并入 "United States", 因 IHG 在前端把它们作为独立目的地展示.
+    """
+    name = (link_text or "").replace(" Hotels", "").strip()
+    if name in US_STATES:
+        return "United States"
+    if name in CA_PROVINCES:
+        return "Canada"
+    return name
 
 
 # ============ 工具函数 ============
@@ -172,6 +225,90 @@ def save_results(hotels_list, csv_path):
         print(f"[+] SQLite 已更新: {db.db_path} ({len(db_hotels)} 个酒店)")
     except Exception as e:
         print(f"[!] SQLite 写入失败 (不影响 CSV/JSON): {e}")
+
+
+# ============ 数据迁移: 修复历史 US/Canada country 字段 ============
+
+def run_fix_country():
+    """一次性修复 hotels.country: 把误存的州/省名批量回写为所属国家.
+
+    修复对象:
+      - country IN US_STATES   → "United States"
+      - country IN CA_PROVINCES → "Canada"
+    其它国家不动. Puerto Rico / Guam / U.S. Virgin Islands 等领土保持原样.
+    """
+    try:
+        from datetime import date as _date
+        sys.path.insert(0, str(Path(__file__).parent))
+        from ihg_db import IHGDatabase
+    except Exception as e:
+        print(f"[!] 无法导入 ihg_db: {e}")
+        return
+
+    db = IHGDatabase()
+    print(f"[fix-country] 数据库: {db.db_path}")
+
+    # 先 dry-run 统计将要影响的酒店
+    placeholders_us = ",".join(["?"] * len(US_STATES))
+    placeholders_ca = ",".join(["?"] * len(CA_PROVINCES))
+
+    us_hotels = db.conn.execute(
+        f"SELECT mnemonic, name, country FROM hotels WHERE country IN ({placeholders_us})",
+        tuple(US_STATES)
+    ).fetchall()
+    ca_hotels = db.conn.execute(
+        f"SELECT mnemonic, name, country FROM hotels WHERE country IN ({placeholders_ca})",
+        tuple(CA_PROVINCES)
+    ).fetchall()
+
+    print(f"[fix-country] 待修复:")
+    print(f"  美国 (按州存的): {len(us_hotels)} 个")
+    print(f"  加拿大 (按省存的): {len(ca_hotels)} 个")
+
+    if not us_hotels and not ca_hotels:
+        print("[fix-country] 无需修复, 数据库已干净 ✓")
+        db.close()
+        return
+
+    # 按州/省维度展示分布
+    from collections import Counter
+    if us_hotels:
+        c = Counter(r["country"] for r in us_hotels)
+        print(f"\n  美国分州分布 (top 10):")
+        for st, n in c.most_common(10):
+            print(f"    {st:30s} {n}")
+    if ca_hotels:
+        c = Counter(r["country"] for r in ca_hotels)
+        print(f"\n  加拿大分省分布:")
+        for pv, n in c.most_common():
+            print(f"    {pv:30s} {n}")
+
+    # 真改
+    today = _date.today().isoformat()
+    cur1 = db.conn.execute(
+        f"UPDATE hotels SET country='United States', updated_at=? WHERE country IN ({placeholders_us})",
+        (today, *US_STATES)
+    )
+    cur2 = db.conn.execute(
+        f"UPDATE hotels SET country='Canada', updated_at=? WHERE country IN ({placeholders_ca})",
+        (today, *CA_PROVINCES)
+    )
+    db.conn.commit()
+
+    print(f"\n[fix-country] 已更新:")
+    print(f"  → country='United States' : {cur1.rowcount} 行")
+    print(f"  → country='Canada'        : {cur2.rowcount} 行")
+
+    # 复核
+    final_us = db.conn.execute(
+        "SELECT COUNT(*) c FROM hotels WHERE country='United States'"
+    ).fetchone()["c"]
+    final_ca = db.conn.execute(
+        "SELECT COUNT(*) c FROM hotels WHERE country='Canada'"
+    ).fetchone()["c"]
+    print(f"\n[fix-country] 修复后总数: 美国={final_us}, 加拿大={final_ca} ✓")
+
+    db.close()
 
 
 # ============ 页面操作 ============
@@ -338,7 +475,15 @@ async def main():
                         help=f'输出 CSV 文件名 (默认 {DEFAULT_OUTPUT})')
     parser.add_argument("--delay", type=float, default=3.0,
                         help='View More 点击后等待秒数 (默认 3)')
+    parser.add_argument("--fix-country", action="store_true",
+                        help='仅运行数据库迁移: 把 hotels.country 中误存的 美国州/加拿大省 名'
+                             '回写为 "United States" / "Canada", 然后退出 (不抓取)')
     args = parser.parse_args()
+
+    # 数据迁移模式: 修复历史误记录的 country 字段, 不进入抓取流程
+    if args.fix_country:
+        run_fix_country()
+        return
 
     targets = [t.strip() for t in args.target.split(",") if t.strip()] if args.target else None
     region_keyword = args.region
@@ -471,8 +616,8 @@ async def main():
 
             for target_link in target_links_to_run:
                 target_url = target_link["href"]
-                target_country = target_link["text"].replace(" Hotels", "").strip()
-                print(f"\n    === {target_link['text']} ===")
+                target_country = resolve_country(target_link["text"])
+                print(f"\n    === {target_link['text']}  → country='{target_country}' ===")
 
                 if not await goto_with_retry(page, target_url):
                     continue
