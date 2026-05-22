@@ -329,24 +329,25 @@ async def goto_with_retry(page, url, max_retries=3, timeout=90000):
 
 async def main():
     parser = argparse.ArgumentParser(description="IHG 酒店列表抓取 - 按国家/地区收集")
-    parser.add_argument("--target", type=str, required=True,
-                        help='目标国家/地区, 多个用逗号分隔 (如 "Vietnam Hotels,Hong Kong SAR Hotels")')
+    parser.add_argument("--target", type=str, default=None,
+                        help='目标国家/地区, 多个用逗号分隔 (如 "Vietnam Hotels,Hong Kong SAR Hotels"); '
+                             '不指定时抓 --region 下所有二级链接 (整个大区域)')
     parser.add_argument("--region", type=str, default="Asia",
-                        help='大区域关键词 (默认 Asia, 可选 Europe/Middle East/Africa 等)')
+                        help='大区域关键词 (默认 Asia, 可选 Europe/Middle East/Africa/US & Canada 等)')
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT,
                         help=f'输出 CSV 文件名 (默认 {DEFAULT_OUTPUT})')
     parser.add_argument("--delay", type=float, default=3.0,
                         help='View More 点击后等待秒数 (默认 3)')
     args = parser.parse_args()
 
-    targets = [t.strip() for t in args.target.split(",") if t.strip()]
+    targets = [t.strip() for t in args.target.split(",") if t.strip()] if args.target else None
     region_keyword = args.region
 
     Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
     print(f"IHG 酒店列表抓取")
-    print(f"  目标: {', '.join(targets)}")
+    print(f"  目标: {', '.join(targets) if targets else '<整个大区域>'}")
     print(f"  区域: {region_keyword}")
     print(f"  输出: {args.output}")
     print("=" * 70)
@@ -439,26 +440,36 @@ async def main():
             }
             """, region_keyword)
 
-            # Step 4: 逐个处理目标国家
-            print(f"[3/4] 开始抓取 {len(targets)} 个目标...")
+            # Step 4: 决定要抓的目标列表
+            if targets is None:
+                # 未指定 --target → 抓整个大区域所有二级链接
+                target_links_to_run = region_links
+                print(f"[3/4] 未指定 --target, 抓整个 '{region_keyword}' 区域下全部 {len(target_links_to_run)} 个目标...")
+            else:
+                # 指定了 --target → 在 region_links 里查找匹配项
+                target_links_to_run = []
+                for target_name in targets:
+                    target_lower = target_name.lower()
+                    matched = None
+                    for lk in region_links:
+                        if target_lower in lk["text"].lower() or target_lower in lk["href"].lower():
+                            matched = lk
+                            break
+                    if matched:
+                        target_links_to_run.append(matched)
+                    else:
+                        print(f"\n    [!] 未匹配 '{target_name}', 跳过")
+                        print(f"    可用选项 ({len(region_links)} 个), 请用 --target 选择其中一个文本:")
+                        for lk in region_links[:50]:
+                            print(f"      - {lk['text']}")
+                        if len(region_links) > 50:
+                            print(f"      ... (还有 {len(region_links) - 50} 个未显示)")
+                if not target_links_to_run:
+                    print(f"    [!] 无任何匹配目标, 退出")
+                    return
+                print(f"[3/4] 开始抓取 {len(target_links_to_run)} 个目标...")
 
-            for target_name in targets:
-                target_link = None
-                target_lower = target_name.lower()
-                for lk in region_links:
-                    if target_lower in lk["text"].lower() or target_lower in lk["href"].lower():
-                        target_link = lk
-                        break
-
-                if not target_link:
-                    print(f"\n    [!] 未匹配 '{target_name}', 跳过")
-                    print(f"    可用选项 ({len(region_links)} 个), 请用 --target 选择其中一个文本:")
-                    for lk in region_links[:50]:
-                        print(f"      - {lk['text']}")
-                    if len(region_links) > 50:
-                        print(f"      ... (还有 {len(region_links) - 50} 个未显示)")
-                    continue
-
+            for target_link in target_links_to_run:
                 target_url = target_link["href"]
                 target_country = target_link["text"].replace(" Hotels", "").strip()
                 print(f"\n    === {target_link['text']} ===")
