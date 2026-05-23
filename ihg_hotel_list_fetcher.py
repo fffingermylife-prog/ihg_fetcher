@@ -266,18 +266,38 @@ def extract_city(url):
 
 
 def load_existing_hotels(csv_path):
-    """加载已有的 CSV 文件, 返回 {mnemonic: hotel_dict}"""
+    """加载已有的 CSV 文件, 返回 {mnemonic: hotel_dict}.
+
+    重要: 加载时会用 address 重新校准每条记录的 country 字段.
+    这是为了让 country 永远是 "address 派生字段", 防止以下污染场景:
+      - 老 CSV 里 country 是历史脏数据 (如 'Florida' 州名), 直接 load 会反向写回
+        SQLite 把 fix-country 的修复成果覆盖掉
+      - 用户手动编辑了 CSV 的 country 字段 (改错了)
+    校准成本极低 (纯字符串处理), 一次性无脏数据后所有调用都是 noop.
+    """
     hotels = {}
     if not Path(csv_path).exists():
         return hotels
     try:
+        recalibrated = 0
         with open(csv_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 mn = row.get("mnemonic", "").strip()
-                if mn:
-                    hotels[mn] = row
-        print(f"    [增量] 已加载 {len(hotels)} 个已有酒店记录")
+                if not mn:
+                    continue
+                # 自动校准 country (address → country)
+                addr = row.get("address", "") or ""
+                if addr.strip():
+                    new_country = extract_country_from_address(addr)
+                    if new_country and new_country != (row.get("country") or "").strip():
+                        row["country"] = new_country
+                        recalibrated += 1
+                hotels[mn] = row
+        msg = f"    [增量] 已加载 {len(hotels)} 个已有酒店记录"
+        if recalibrated:
+            msg += f"  (其中 {recalibrated} 条 country 字段已根据 address 自动校准)"
+        print(msg)
     except Exception as e:
         print(f"    [!] 加载已有文件失败: {e}")
     return hotels
@@ -417,8 +437,10 @@ def run_fix_country():
             print(f"    {mn:8s} country={c!r:20s} address={addr[:80]}")
 
     if not to_update:
-        print("\n[fix-country] 无需修复, 数据库已干净 ✓")
+        print("\n[fix-country] SQLite 数据库已干净 ✓")
         db.close()
+        # 即便 SQLite 干净, CSV/JSON 也可能脏 (用户独立编辑过), 一起校准
+        _sync_fix_csv_json(DEFAULT_OUTPUT)
         return
 
     # 执行修复
@@ -434,12 +456,66 @@ def run_fix_country():
     final = db.conn.execute(
         "SELECT country, COUNT(*) c FROM hotels GROUP BY country ORDER BY c DESC LIMIT 30"
     ).fetchall()
-    print(f"\n[fix-country] ✓ 已更新 {len(to_update)} 行")
+    print(f"\n[fix-country] ✓ SQLite 已更新 {len(to_update)} 行")
     print(f"[fix-country] 修复后 country 分布 (top 30):")
     for r in final:
         print(f"    {(r['country'] or '(空)'):30s} {r['c']:5d}")
 
     db.close()
+
+    # ─── 同步修复 CSV / JSON (如果存在) ───
+    # 没这步会被下一次抓取的 load_existing_hotels() 反向污染回 SQLite
+    _sync_fix_csv_json(DEFAULT_OUTPUT)
+
+
+def _sync_fix_csv_json(csv_path):
+    """把 CSV / JSON 里 country 字段也基于 address 重算一遍, 保持三处一致."""
+    csv_p = Path(csv_path)
+    json_p = Path(csv_path.replace(".csv", ".json"))
+    if not csv_p.exists() and not json_p.exists():
+        print(f"\n[fix-country] CSV/JSON 不存在 ({csv_p}), 跳过")
+        return
+
+    if csv_p.exists():
+        print(f"\n[fix-country] 同步修复 CSV: {csv_p.resolve()}")
+        rows_in = []
+        with open(csv_p, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or []
+            for row in reader:
+                rows_in.append(row)
+        changed = 0
+        for row in rows_in:
+            addr = row.get("address", "") or ""
+            if not addr.strip():
+                continue
+            new_c = extract_country_from_address(addr)
+            if new_c and new_c != (row.get("country") or "").strip():
+                row["country"] = new_c
+                changed += 1
+        with open(csv_p, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows_in:
+                writer.writerow(row)
+        print(f"[fix-country] ✓ CSV 已更新 {changed} 行 (共 {len(rows_in)} 条)")
+
+    if json_p.exists():
+        print(f"[fix-country] 同步修复 JSON: {json_p.resolve()}")
+        with open(json_p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        changed = 0
+        for h in data:
+            addr = h.get("address", "") or ""
+            if not addr.strip():
+                continue
+            new_c = extract_country_from_address(addr)
+            if new_c and new_c != (h.get("country") or "").strip():
+                h["country"] = new_c
+                changed += 1
+        with open(json_p, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print(f"[fix-country] ✓ JSON 已更新 {changed} 行 (共 {len(data)} 条)")
 
 
 # ============ 页面操作 ============
