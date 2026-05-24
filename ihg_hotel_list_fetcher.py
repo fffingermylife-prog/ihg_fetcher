@@ -23,6 +23,9 @@ IHG 酒店列表抓取工具 - 按国家/地区收集酒店信息
 
     # 一次性修复历史 country 误记录 (基于 address 重算, 不抓取)
     python ihg_hotel_list_fetcher.py --fix-country
+
+    # 一次性按规则修正 brand_code (name 含 holiday inn resort/HUALUXE/Iberostar/Ruby)
+    python ihg_hotel_list_fetcher.py --fix-brand
 """
 
 import argparse
@@ -518,6 +521,165 @@ def _sync_fix_csv_json(csv_path):
         print(f"[fix-country] ✓ JSON 已更新 {changed} 行 (共 {len(data)} 条)")
 
 
+# ============ --fix-brand: 按用户规则修正 brand_code ============
+
+def derive_brand_from_name(name):
+    """根据酒店 name 推断 brand_code (用户自定义规则).
+
+    规则 (按顺序匹配, 命中即返回):
+        1. name 含 "Holiday Inn Resort" (大小写不敏感)        → "HI"
+        2. name 含 "HUALUXE" (严格大写)                        → "华巴"
+        3. name 含 "Iberostar" (大小写不敏感)                  → "Iberostar"
+        4. name 含 "Ruby" (大小写不敏感, 单词边界 \\bRuby\\b)  → "Ruby"
+    匹配不上返回 None (调用方应保留原 brand_code).
+    """
+    if not name:
+        return None
+    name_lower = name.lower()
+    if "holiday inn resort" in name_lower:
+        return "HI"
+    if "HUALUXE" in name:  # 严格大写
+        return "华巴"
+    if "iberostar" in name_lower:
+        return "Iberostar"
+    if re.search(r'\bRuby\b', name, re.IGNORECASE):
+        return "Ruby"
+    return None
+
+
+def run_fix_brand():
+    """按用户规则一次性修正 hotels.brand_code, 同步 SQLite + CSV + JSON.
+
+    规则: 见 derive_brand_from_name() docstring.
+    name 没匹配上的酒店保持原 brand_code 不动.
+    """
+    try:
+        from datetime import date as _date
+        from collections import Counter
+        sys.path.insert(0, str(Path(__file__).parent))
+        from ihg_db import IHGDatabase
+    except Exception as e:
+        print(f"[!] 无法导入 ihg_db: {e}")
+        return
+
+    db = IHGDatabase()
+    print(f"[fix-brand] 数据库绝对路径: {Path(db.db_path).resolve()}")
+
+    rows = db.conn.execute(
+        "SELECT mnemonic, name, brand_code FROM hotels"
+    ).fetchall()
+    print(f"[fix-brand] 共 {len(rows)} 个酒店, 开始按规则匹配 name...")
+
+    to_update = []  # [(mnemonic, name, old_brand, new_brand)]
+    no_change = 0
+    no_match = 0
+
+    for r in rows:
+        new_brand = derive_brand_from_name(r["name"])
+        if new_brand is None:
+            no_match += 1
+            continue
+        if new_brand == (r["brand_code"] or ""):
+            no_change += 1
+            continue
+        to_update.append((r["mnemonic"], r["name"], r["brand_code"], new_brand))
+
+    print(f"\n[fix-brand] 分析结果:")
+    print(f"  → 需修正:        {len(to_update)} 个")
+    print(f"  → 已正确:        {no_change} 个 (规则命中且 brand_code 已对)")
+    print(f"  → 规则未命中:    {no_match} 个 (保持原 brand_code)")
+
+    if to_update:
+        # 按 (旧 → 新) 聚合
+        change_counter = Counter((old, new) for _, _, old, new in to_update)
+        print(f"\n[fix-brand] 变更分布 (按 旧 → 新):")
+        for (old, new), n in change_counter.most_common():
+            old_disp = old if old else "(空)"
+            print(f"    {old_disp:15s} → {new:15s}  {n:5d} 行")
+
+        # 列前 15 个具体酒店, 让用户复核
+        print(f"\n[fix-brand] 受影响酒店示例 (最多前 15 个):")
+        for mn, name, old, new in to_update[:15]:
+            old_disp = old if old else "(空)"
+            print(f"    {mn:8s}  {old_disp:8s} → {new:10s}  {(name or '')[:60]}")
+        if len(to_update) > 15:
+            print(f"    ... 还有 {len(to_update) - 15} 个未显示")
+
+    if not to_update:
+        print("\n[fix-brand] 无需修复, brand_code 已干净 ✓")
+        db.close()
+        # 即便 SQLite 干净, CSV/JSON 也可能脏, 一起校准
+        _sync_fix_brand_csv_json(DEFAULT_OUTPUT)
+        return
+
+    # 执行修复
+    today = _date.today().isoformat()
+    for mn, _name, _old, new_brand in to_update:
+        db.conn.execute(
+            "UPDATE hotels SET brand_code=?, updated_at=? WHERE mnemonic=?",
+            (new_brand, today, mn)
+        )
+    db.conn.commit()
+
+    # 复核
+    final = db.conn.execute(
+        "SELECT brand_code, COUNT(*) c FROM hotels GROUP BY brand_code ORDER BY c DESC LIMIT 30"
+    ).fetchall()
+    print(f"\n[fix-brand] ✓ SQLite 已更新 {len(to_update)} 行")
+    print(f"[fix-brand] 修复后 brand_code 分布 (top 30):")
+    for r in final:
+        print(f"    {(r['brand_code'] or '(空)'):15s} {r['c']:5d}")
+
+    db.close()
+
+    # 同步修 CSV / JSON
+    _sync_fix_brand_csv_json(DEFAULT_OUTPUT)
+
+
+def _sync_fix_brand_csv_json(csv_path):
+    """把 CSV / JSON 里 brand_code 字段也按 derive_brand_from_name 重算一遍, 保持三处一致."""
+    csv_p = Path(csv_path)
+    json_p = Path(csv_path.replace(".csv", ".json"))
+    if not csv_p.exists() and not json_p.exists():
+        print(f"\n[fix-brand] CSV/JSON 不存在 ({csv_p}), 跳过")
+        return
+
+    if csv_p.exists():
+        print(f"\n[fix-brand] 同步修复 CSV: {csv_p.resolve()}")
+        rows_in = []
+        with open(csv_p, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or []
+            for row in reader:
+                rows_in.append(row)
+        changed = 0
+        for row in rows_in:
+            new_b = derive_brand_from_name(row.get("name", ""))
+            if new_b and new_b != (row.get("brand_code") or ""):
+                row["brand_code"] = new_b
+                changed += 1
+        with open(csv_p, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows_in:
+                writer.writerow(row)
+        print(f"[fix-brand] ✓ CSV 已更新 {changed} 行 (共 {len(rows_in)} 条)")
+
+    if json_p.exists():
+        print(f"[fix-brand] 同步修复 JSON: {json_p.resolve()}")
+        with open(json_p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        changed = 0
+        for h in data:
+            new_b = derive_brand_from_name(h.get("name", ""))
+            if new_b and new_b != (h.get("brand_code") or ""):
+                h["brand_code"] = new_b
+                changed += 1
+        with open(json_p, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print(f"[fix-brand] ✓ JSON 已更新 {changed} 行 (共 {len(data)} 条)")
+
+
 # ============ 页面操作 ============
 
 async def collect_hotels_from_page(page, delay=3.0, country_fallback=""):
@@ -720,11 +882,21 @@ async def main():
     parser.add_argument("--fix-country", action="store_true",
                         help='不抓取, 仅根据 hotels.address 字段重算所有酒店的 country (一次性迁移). '
                              '修复所有历史误记录 (州/省名/城市名/跨区域错归类), 一刀切.')
+    parser.add_argument("--fix-brand", action="store_true",
+                        help='不抓取, 仅根据用户规则重算 brand_code (一次性迁移). 规则: '
+                             'name 含 "holiday inn resort"→HI, 含 "HUALUXE"→华巴, '
+                             '含 "Iberostar"→Iberostar, 含 "Ruby"(单词边界)→Ruby. '
+                             '同步修 SQLite + CSV + JSON 三处.')
     args = parser.parse_args()
 
     # 数据迁移模式: 修复历史 country 字段, 不进入抓取流程
     if args.fix_country:
         run_fix_country()
+        return
+
+    # 数据迁移模式: 按用户规则修正 brand_code, 不进入抓取流程
+    if args.fix_brand:
+        run_fix_brand()
         return
 
     targets = [t.strip() for t in args.target.split(",") if t.strip()] if args.target else None
