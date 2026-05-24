@@ -101,7 +101,8 @@ def load_hotel_codes(args):
 
     elif args.from_csv:
         try:
-            with open(args.from_csv, "r", encoding="utf-8") as f:
+            # utf-8-sig: 兼容带 BOM (Excel/make_tier.py/hotel_list_fetcher 输出) 和不带 BOM 的 CSV
+            with open(args.from_csv, "r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     code = row.get("mnemonic", "").strip().upper()
@@ -112,7 +113,7 @@ def load_hotel_codes(args):
 
     elif args.from_json:
         try:
-            with open(args.from_json, "r", encoding="utf-8") as f:
+            with open(args.from_json, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             hotels = data.get("hotels", data) if isinstance(data, dict) else data
             if isinstance(hotels, list):
