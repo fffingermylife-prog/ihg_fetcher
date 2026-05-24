@@ -37,21 +37,21 @@ DEFAULT_TIER_A = ["DADHA", "HKGKL", "HKGKH", "HKGIN", "PQCCP"]
 
 # Tier B 品牌定义
 PREMIUM_BRANDS = {
-    # 顶级 (全球任何位置都可能有 bug 积分价)
+    # 顶级 (全球任何位置都纳入, 因为 bug 积分价高发)
     "IC",       # InterContinental
     "RC",       # Regent
     "华巴",     # HUALUXE
     "SR",       # Six Senses
-    "KI",       # Kimpton
-    "HT",       # Hotel Indigo
+    "KI",       # Kimpton (美国本土品牌, 全球纳入因为偶有积分 bug)
     "VX",       # Vignette Collection (精选系列)
 }
 
 RESORT_BRANDS = {
-    # 中高端, 在度假区也可能 bug
+    # 中高端 / 精选品牌, 仅在度假区国家纳入 (城市的 Hotel Indigo / Crowne Plaza 多是商务酒店, 噪音多)
+    "HT",       # Hotel Indigo (从 PREMIUM 移到这里 - 城市的 Indigo bug 少, 度假区的有价值)
+    "CP",       # Crowne Plaza (用户关注的 5 家中 HKGKL/HKGKH/PQCCP 都是这个品牌)
     "VC",       # voco
-    "CP",       # Crowne Plaza
-    "RS",       # Holiday Inn Resort (注意: 用户已统一为 HI, 这里保留以防有未修
+    "RS",       # Holiday Inn Resort (用户已统一为 HI, 这里保留以防漏)
 }
 
 # 度假目的地 country 白名单 (RESORT_BRANDS 仅在这些国家纳入 Tier B)
@@ -71,8 +71,10 @@ RESORT_COUNTRIES = {
     "United Arab Emirates", "Oman", "Egypt", "Qatar",
     # 欧洲度假岛 / 海岸
     "Spain", "Italy", "Greece", "Croatia", "Portugal", "Cyprus", "Malta",
-    # 东南亚海岛备份 (中国海南也算)
-    "Mainland China",  # 三亚 / 海南
+    # 注意: Mainland China 不在此列. country 字段没有省/城市粒度,
+    #       中国大陆中高端品牌大部分在城市 (北京/上海/广州/成都),
+    #       不是度假区. 顶级品牌 (IC/华巴等) 已在 PREMIUM_BRANDS 全球纳入,
+    #       三亚/海南的 IC/华巴会自动包含, 不会漏.
 }
 
 # 评分门槛 (低于此分一概忽略, 排除新店 / 边缘酒店)
