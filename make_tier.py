@@ -7,15 +7,19 @@ make_tier.py - 把 hotels DB 切成监控 tier 子集 (按品牌 + 地区 + 评�
 
 输出两个 CSV (格式跟 ihg_hotels.csv 一致, 直接喂给 batch_monitor --from-csv):
     tier_a_critical.csv  -- 关注核心 (从 notify_config.json hotels 字段读, 无则用默认 5 家)
-                           频率建议: 每天 3 次全量
-    tier_b_premium.csv   -- 高端品牌全球 + 中高端品牌在度假区
+                           可选, 用于测试或个别酒店高频监控
+    tier_b_premium.csv   -- 主战场: 高端品牌全球 + 中高端品牌在度假区
                            频率建议: 每天 1 次全量 (晚上)
+                           注: Tier B 不排除 Tier A 的酒店, 纯按规则筛.
+                                两个 tier 互相独立 (可能有重叠).
 
 用法:
     python make_tier.py
-    然后:
-    python ihg_batch_monitor.py --from-csv tier_a_critical.csv --auto-switch
+    然后只跑 Tier B (主用):
     python ihg_batch_monitor.py --from-csv tier_b_premium.csv --auto-switch
+
+    Tier A 可选 (测试/个别酒店高频):
+    python ihg_batch_monitor.py --from-csv tier_a_critical.csv --auto-switch
 
 调整规则: 直接编辑下面的 PREMIUM_BRANDS / RESORT_BRANDS / RESORT_COUNTRIES.
 """
@@ -154,18 +158,15 @@ def main():
         print(f"    ⚠ 这 {len(missing)} 个 mnemonic 在 DB 找不到: {missing}")
 
     # ── Tier B ──
+    # 注: Tier B 不排除 Tier A 的酒店, 两个 tier 互相独立 (可能有重叠).
+    # 纯按 [品牌 ∪ (品牌 ∩ 度假区)] + 评分门槛 筛选.
     print()
     print("=" * 70)
-    tier_a_set = set(tier_a_codes)
     tier_b_rows = []
     rejected_low_rating = 0
     rejected_brand_not_match = 0
 
     for r in all_rows:
-        mn = r["mnemonic"]
-        if mn in tier_a_set:
-            continue   # 不重复纳入
-
         rating = parse_rating(r.get("rating"))
         if rating is not None and rating < MIN_RATING:
             rejected_low_rating += 1
@@ -190,7 +191,6 @@ def main():
     write_csv(OUTPUT_TIER_B, tier_b_rows)
     print(f"\n[Tier B] {len(tier_b_rows)} 个酒店 → {OUTPUT_TIER_B}")
     print(f"    剔除原因:")
-    print(f"      在 Tier A 跳过:      {len(tier_a_set & set(by_mn.keys()))} 个")
     print(f"      评分 < {MIN_RATING}:           {rejected_low_rating} 个")
     print(f"      品牌+地区不匹配:     {rejected_brand_not_match} 个")
 
@@ -208,11 +208,12 @@ def main():
     # ── 使用说明 ──
     print()
     print("=" * 70)
-    print("✓ 监控建议节奏:")
-    print(f"  python ihg_batch_monitor.py --from-csv {OUTPUT_TIER_A} --auto-switch")
-    print(f"     → 每天 3 次 (07:35 / 14:00 / 20:00), 严阈值, 不漏任何机会")
+    print("✓ 监控建议:")
     print(f"  python ihg_batch_monitor.py --from-csv {OUTPUT_TIER_B} --auto-switch")
-    print(f"     → 每天 1 次 (晚上), 标准阈值, 捞品牌级 bug")
+    print(f"     → 主战场, 每天 1 次全量 (晚上)")
+    print(f"     → 增量模式可加 --incremental, 速度快 6 倍, 适合每天跑")
+    print(f"  python ihg_batch_monitor.py --from-csv {OUTPUT_TIER_A} --auto-switch")
+    print(f"     → 可选, 测试或个别酒店高频监控")
     print()
     print("调整规则: 直接编辑 make_tier.py 顶部的")
     print("  PREMIUM_BRANDS / RESORT_BRANDS / RESORT_COUNTRIES / MIN_RATING")
