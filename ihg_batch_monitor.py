@@ -271,12 +271,24 @@ async def fetch_usd_rate(page, currency):
 
         if result and result.get("ok") and result.get("data"):
             results = result["data"].get("results", [])
-            if results:
-                rate = results[0].get("result")
-                if rate and rate > 0:
+            # IHG 接口对 CNY/EUR 等"品牌定制汇率"币种会返回两条:
+            #   - source=K: 品牌专用, 实测 CNY 的 K 源停留在 2022-11 的过期值 11.47, 会让本地币 → USD 虚高 78 倍
+            #   - source=P: 官方主源, 才是当前实时汇率
+            # 必须优先取 P, 取不到再 fallback 到第 0 条
+            primary = next((r for r in results if r.get("source") == "P"), None)
+            target = primary or (results[0] if results else None)
+            if target:
+                rate = target.get("result")
+                # sanity check: 1 单位本地币 → USD 的合理区间 (1e-7, 5)
+                # 上限 5 已覆盖 KWD (~3.27)、BHD (~2.65)、OMR (~2.60) 等最高价值货币
+                # 同时挡住 CNY=11.47 这种异常 stale 值
+                if rate and 1e-7 < rate < 5:
                     _usd_rate_cache[currency] = rate
-                    print(f"  [汇率] {currency} → USD: {rate:.6f}")
+                    src = target.get("source", "?")
+                    print(f"  [汇率] {currency} → USD: {rate:.6f} (source={src})")
                     return rate
+                else:
+                    print(f"  [汇率] {currency} 异常值 rate={rate} source={target.get('source')}, 已丢弃")
         print(f"  [汇率] {currency} → USD 获取失败, 跳过 USD 转换")
     except Exception as e:
         print(f"  [汇率] {currency} 异常: {str(e)[:60]}")
