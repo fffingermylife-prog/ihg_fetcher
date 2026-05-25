@@ -49,8 +49,9 @@ API_KEY = "se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y"
 POINTS_RATE_PLAN_CODES = ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"]
 
 WINDOW_SIZE_DAYS = 62
-REQUEST_DELAY_MS = (200, 500)  # 随机延迟区间 (毫秒)
+REQUEST_DELAY_MS = (150, 350)  # 随机延迟区间 (毫秒) - 调低 ~30% 提速, 仍在浏览器自然请求间隔范围
 MAX_RETRIES = 1
+ABORT_THRESHOLD = 2  # 本批累计失败次数 ≥ 此值才 abort 整批 (旧版 1 = 任意失败即 abort, 极端浪费)
 
 # 数据目录
 DATA_DIR = "./ihg_data"
@@ -608,15 +609,19 @@ def save_prices(hotel_code, prices, days_queried):
 
 # ============ 并发 Worker ============
 
-async def worker(worker_id, page, batch_queue, results, requeue, windows, dry_run, abort_event):
+async def worker(worker_id, page, batch_queue, results, requeue, windows, dry_run,
+                 abort_event, failure_counter, abort_threshold):
     """并发 worker (批次模式): 从批次队列取酒店, 跑完即写入 results;
-    任何失败立即触发 abort_event 通知主流程关 context 重建。
+    本批累计失败次数达到 abort_threshold 才触发整批中止 (避免单个酒店瞬时
+    问题导致整批白跑)。
 
     Args:
         batch_queue: 仅含本批次酒店的 asyncio.Queue, 元素 (idx, code, total)
         results: 成功结果会 append 到这个 list (主流程共享)
         requeue: 失败/未完成的酒店 code 会 append 到这个 list, 主流程下批重试
-        abort_event: 任一 worker 检测到失败 → set; 其他 worker 跑完手头任务即退出
+        abort_event: 触发后所有 worker 跑完手头任务即退出
+        failure_counter: list[1] 共享计数器 ([0] 表示当前累计失败数)
+        abort_threshold: 累计失败到此阈值时才 set abort_event
     """
     while True:
         # 1. 检查批次是否已被通知中止
@@ -653,14 +658,14 @@ async def worker(worker_id, page, batch_queue, results, requeue, windows, dry_ru
                         print(f"  [W{worker_id}] {label} 超时, 重试 ({retries}/{MAX_RETRIES})...")
                         await page.wait_for_timeout(random.randint(3000, 5000))
                     else:
-                        print(f"  [W{worker_id}] {label} 超时, 触发批次重建")
+                        print(f"  [W{worker_id}] {label} 超时")
                 except Exception as e:
                     retries += 1
                     if retries <= MAX_RETRIES:
                         print(f"  [W{worker_id}] {label} 失败, 重试 ({retries}/{MAX_RETRIES})...")
                         await page.wait_for_timeout(random.randint(2000, 4000))
                     else:
-                        print(f"  [W{worker_id}] {label} 失败, 触发批次重建: {str(e)[:100]}")
+                        print(f"  [W{worker_id}] {label} 失败: {str(e)[:100]}")
 
             elapsed = time.time() - t0
 
@@ -689,17 +694,26 @@ async def worker(worker_id, page, batch_queue, results, requeue, windows, dry_ru
                 print(f"  [{idx}/{total_count}] {label} ✓ {elapsed:.1f}s ({len(prices)}天, {status})")
                 completed = True
             else:
-                # 失败: 放回 requeue 让下个批次 (新节点) 重试, 并触发整批中止
+                # 失败: 放回 requeue, 计数器 +1; 达到阈值才整批 abort
+                # asyncio 单线程, list[0] += 1 是原子操作, 不需要锁
                 requeue.append(hotel_code)
-                abort_event.set()
-                print(f"  [{idx}/{total_count}] {label} ✗ {elapsed:.1f}s (失败, 已触发批次重建)")
+                failure_counter[0] += 1
+                if failure_counter[0] >= abort_threshold:
+                    abort_event.set()
+                    print(f"  [{idx}/{total_count}] {label} ✗ {elapsed:.1f}s "
+                          f"(本批累计失败 {failure_counter[0]} ≥ {abort_threshold}, 触发批次重建)")
+                else:
+                    print(f"  [{idx}/{total_count}] {label} ✗ {elapsed:.1f}s "
+                          f"(失败 {failure_counter[0]}/{abort_threshold}, 其他 worker 继续)")
                 completed = True
         finally:
             # 兜底: 如果 worker 被外部 cancel 或抛出未捕获异常,
-            # 当前任务也要放回 requeue, 避免酒店被吞掉
+            # 当前任务也要放回 requeue 并加计数, 避免酒店被吞掉
             if not completed:
                 requeue.append(hotel_code)
-                abort_event.set()
+                failure_counter[0] += 1
+                if failure_counter[0] >= abort_threshold:
+                    abort_event.set()
 
 
 async def run_batch(playwright, batch_codes, total_index_map, concurrency, windows,
@@ -750,7 +764,8 @@ async def run_batch(playwright, batch_codes, total_index_map, concurrency, windo
         for i, page in enumerate(pages):
             try:
                 await page.goto(SEED_URL, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(random.randint(1000, 2000))
+                # 提速: session warmup 等待时间 1-2s -> 0.8-1.5s, 实测 Akamai cookie 落地够用
+                await page.wait_for_timeout(random.randint(800, 1500))
                 print(f"    Tab {i+1} session 就绪 ✓")
             except Exception as e:
                 print(f"    Tab {i+1} session 建立失败: {str(e)[:80]}")
@@ -769,8 +784,12 @@ async def run_batch(playwright, batch_codes, total_index_map, concurrency, windo
             batch_queue.put_nowait((idx, code, total))
 
         # 4. 启动并发 worker
+        # failure_counter: list 包装一个 int 作为 worker 间共享的可变计数器
+        # (asyncio 单线程, += 操作原子, 不需要锁)
+        failure_counter = [0]
         worker_tasks = [
-            worker(i + 1, page, batch_queue, results, requeue, windows, dry_run, abort_event)
+            worker(i + 1, page, batch_queue, results, requeue, windows, dry_run,
+                   abort_event, failure_counter, ABORT_THRESHOLD)
             for i, page in enumerate(pages)
         ]
         await asyncio.gather(*worker_tasks)
