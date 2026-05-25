@@ -416,9 +416,9 @@ async def fetch_hotel_prices(page, hotel_code, windows):
     for cur in currencies:
         await fetch_usd_rate(page, cur)
 
-    # 计算 USD 价格 + CPP (USD 美分/积分)
-    # CPP = USD 价格 × 100 / 积分 = 美分/积分
-    # 例: USD 80, 10000 积分 → CPP = 0.80 美分/积分 (即每万积分价值 $80)
+    # 计算 USD 价格 + CPP (单位: USD/万分, 即每 10000 积分对应多少 USD)
+    # CPP = USD 价格 × 10000 / 积分
+    # 例: USD 80, 10000 积分 → CPP = 80 USD/万分 (即每万积分价值 $80)
     for p in merged:
         cur = p.get("currency")
         rate = _usd_rate_cache.get(cur) if cur else None
@@ -430,9 +430,9 @@ async def fetch_hotel_prices(page, hotel_code, windows):
         else:
             p["cash_price_usd"] = None
 
-        # CPP (USD 美分/积分)
+        # CPP (USD/万分)
         if p["cash_price_usd"] and p.get("points") and p["points"] > 0:
-            p["cpp"] = round(p["cash_price_usd"] * 100 / p["points"], 2)
+            p["cpp"] = round(p["cash_price_usd"] * 10000 / p["points"], 2)
         else:
             p["cpp"] = None
 
@@ -1172,6 +1172,11 @@ async def main():
     # ============ 批次循环 ============
     # 每批: 启动新 context (绑定当前节点) → 跑 N 个酒店 → 关 context → 切节点 → 下一批
     # 同一批内任一失败 → abort 整批 → 未完成酒店放回队首, 下批 (新节点) 重试
+    #
+    # 三道安全锁 (避免主循环死循环):
+    # 1) processed_codes: 已成功或已放弃的酒店, 任何情况下都不会再进 batch
+    # 2) MAX_TOTAL_ITERATIONS: 总迭代上限, 超过强制退出
+    # 3) 进度停滞检测: 连续 5 批没新增成功 + remaining 没缩小, 强制放弃剩余
 
     # 全局索引映射 (按初始顺序固定, 重试时显示同一个 idx)
     total_index_map = {code: (idx, len(hotel_codes)) for idx, code in enumerate(hotel_codes, 1)}
@@ -1180,6 +1185,12 @@ async def main():
     MAX_BATCH_ATTEMPTS = 3
     attempt_count = {code: 0 for code in hotel_codes}
     abandoned = []   # 超过 MAX_BATCH_ATTEMPTS 后放弃的酒店
+
+    # 已完结集合 (成功 or 放弃), 双保险防止酒店在 batch / remaining 间循环
+    processed_codes = set()
+    # 卡死保护
+    MAX_TOTAL_ITERATIONS = max(50, 10 * len(hotel_codes))  # 远大于正常情况的上限
+    STAGNATION_LIMIT = 5  # 连续多少批无进展则强制结束
 
     # 构建 launch 参数 (每批用同一份, 但 context 每批新建)
     launch_opts = {
@@ -1196,6 +1207,8 @@ async def main():
     remaining = list(hotel_codes)
     results = []
     batch_num = 0
+    stagnation_count = 0
+    last_progress_metric = (0, len(hotel_codes))  # (results_len, remaining_len)
 
     async with async_playwright() as p:
         t_start = time.time()
@@ -1203,7 +1216,30 @@ async def main():
         while remaining:
             batch_num += 1
 
-            # 取一批: 跳过已超过最大尝试次数的酒店
+            # ===== 安全锁 #2: 总迭代上限 =====
+            if batch_num > MAX_TOTAL_ITERATIONS:
+                print(f"\n[!] 已超过 MAX_TOTAL_ITERATIONS={MAX_TOTAL_ITERATIONS} 批, 强制结束")
+                print(f"    剩余未跑: {len(remaining)} 个 → 全部移入 abandoned")
+                for code in remaining:
+                    if code not in abandoned and code not in processed_codes:
+                        abandoned.append(code)
+                        processed_codes.add(code)
+                remaining = []
+                break
+
+            # ===== 安全锁 #1: 过滤掉已完结的酒店 =====
+            # 任何理由 (workers 重复 requeue / actually_requeue 含意外重复 / etc) 都不会让
+            # 已经 success 或 abandon 的酒店再进入批次
+            before_filter = len(remaining)
+            remaining = [c for c in remaining if c not in processed_codes]
+            filtered_n = before_filter - len(remaining)
+            if filtered_n > 0:
+                print(f"[批次 {batch_num}] 过滤掉 {filtered_n} 个已完结酒店")
+
+            if not remaining:
+                break
+
+            # ===== 取一批 =====
             batch = []
             new_remaining = []
             for code in remaining:
@@ -1211,11 +1247,18 @@ async def main():
                     if attempt_count[code] >= MAX_BATCH_ATTEMPTS:
                         if code not in abandoned:
                             abandoned.append(code)
+                        processed_codes.add(code)
                         continue
                     batch.append(code)
                     attempt_count[code] += 1
                 else:
-                    new_remaining.append(code)
+                    # 即使 batch 满了, 这里也要检查是否已超尝试次数, 避免 abandoned 无限往后挤
+                    if attempt_count[code] >= MAX_BATCH_ATTEMPTS:
+                        if code not in abandoned:
+                            abandoned.append(code)
+                        processed_codes.add(code)
+                    else:
+                        new_remaining.append(code)
             remaining = new_remaining
 
             if not batch:
@@ -1223,7 +1266,8 @@ async def main():
 
             node_label = clash_mgr.current_node if clash_mgr else "直连"
             print(f"\n{'─'*80}")
-            print(f"[批次 {batch_num}] 节点: {node_label} | 本批 {len(batch)} 个 | 待跑剩余 {len(remaining)} 个")
+            print(f"[批次 {batch_num}] 节点: {node_label} | 本批 {len(batch)} 个 | 待跑剩余 {len(remaining)} 个 "
+                  f"| 已成功 {len(results)} | 已放弃 {len(abandoned)}")
             print(f"  酒店: {', '.join(batch)}")
             print(f"{'─'*80}")
 
@@ -1240,18 +1284,41 @@ async def main():
                 batch_requeue = list(batch)
 
             results.extend(batch_results)
+            # 标记本批成功的酒店为已完结
+            for r in batch_results:
+                processed_codes.add(r["hotel_code"])
+
             batch_elapsed = time.time() - t_batch
 
             # 失败/未完成的放回队首 (优先在下个批次/新节点重试)
             if batch_requeue:
-                # 去重防御 (同一 code 不会同时出现在 results 和 requeue, 但保险一下)
                 seen_in_results = {r["hotel_code"] for r in batch_results}
-                actually_requeue = [c for c in batch_requeue if c not in seen_in_results]
+                # 双重过滤: 不在本批结果里 + 不在已完结集合里
+                actually_requeue = [
+                    c for c in batch_requeue
+                    if c not in seen_in_results and c not in processed_codes
+                ]
                 remaining = actually_requeue + remaining
                 print(f"[批次 {batch_num}] 完成 {len(batch_results)}/{len(batch)} | "
                       f"放回 {len(actually_requeue)} 个待重试 | 耗时 {batch_elapsed:.1f}s")
             else:
                 print(f"[批次 {batch_num}] 完成 ✓ {len(batch_results)}/{len(batch)} | 耗时 {batch_elapsed:.1f}s")
+
+            # ===== 安全锁 #3: 进度停滞检测 =====
+            cur_metric = (len(results), len(remaining))
+            if cur_metric == last_progress_metric:
+                stagnation_count += 1
+                if stagnation_count >= STAGNATION_LIMIT:
+                    print(f"\n[!] 连续 {STAGNATION_LIMIT} 批无进展 (results={cur_metric[0]} remaining={cur_metric[1]}), 强制结束")
+                    for code in remaining:
+                        if code not in processed_codes:
+                            abandoned.append(code)
+                            processed_codes.add(code)
+                    remaining = []
+                    break
+            else:
+                stagnation_count = 0
+                last_progress_metric = cur_metric
 
             # 如果还有酒店要跑, 切换节点准备下一批
             if remaining and clash_mgr:
@@ -1260,7 +1327,8 @@ async def main():
                 await asyncio.sleep(2)  # 给 Clash 路由表更新时间
 
         total_time = time.time() - t_start
-        print(f"\n[完成] 共 {batch_num} 批, 总耗时: {total_time:.1f}s")
+        print(f"\n[完成] 共 {batch_num} 批, 总耗时: {total_time:.1f}s "
+              f"(成功 {len(results)} | 放弃 {len(abandoned)})")
 
     # 标记被放弃的酒店 (放进 results 让报告里看到)
     for code in abandoned:

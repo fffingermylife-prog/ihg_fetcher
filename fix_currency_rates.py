@@ -125,7 +125,7 @@ async def main():
             SELECT COUNT(*) AS n,
                    SUM(CASE WHEN ABS(cash_price_usd
                        - ROUND(COALESCE(cash_price_after_tax, cash_price) * ?, 2)) > 0.01
-                            THEN 1 ELSE 0 END) AS need_fix
+                            THEN 1 ELSE 0 END) AS need_fix_usd
             FROM prices
             WHERE currency = ?
               AND COALESCE(cash_price_after_tax, cash_price) IS NOT NULL
@@ -133,8 +133,8 @@ async def main():
             """,
             (rate, cur),
         ).fetchone()
-        n, need_fix = row
-        print(f"  {cur:4s}: 共 {n} 条, 其中需要修正 {need_fix} 条")
+        n, need_fix_usd = row
+        print(f"  {cur:4s}: 共 {n} 条, 其中现金USD 需要修正 {need_fix_usd} 条 (cpp 全部按新公式 USD/万分 重算)")
 
     if args.dry_run:
         print("\n--dry-run, 不修改 DB")
@@ -153,14 +153,14 @@ async def main():
     total = 0
     for cur, rate in rates.items():
         # cash_price_usd = COALESCE(after_tax, cash_price) × rate
-        # cpp            = cash_price_usd × 100 / points
+        # cpp            = cash_price_usd × 10000 / points  (单位: USD/万分)
         cur_count = conn.execute(
             """
             UPDATE prices
             SET cash_price_usd = ROUND(COALESCE(cash_price_after_tax, cash_price) * ?, 2),
                 cpp = CASE
                     WHEN points IS NOT NULL AND points > 0
-                    THEN ROUND(COALESCE(cash_price_after_tax, cash_price) * ? * 100.0 / points, 2)
+                    THEN ROUND(COALESCE(cash_price_after_tax, cash_price) * ? * 10000.0 / points, 2)
                     ELSE NULL
                 END
             WHERE currency = ?

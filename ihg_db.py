@@ -135,7 +135,8 @@ class IHGDatabase:
 
     def save_prices(self, hotel_code, prices, fetch_date=None):
         """保存价格数据 (批量插入, 忽略重复)
-        注: cpp 字段含义为 USD 美分/积分 (新版), 旧版数据可能是本地币*100/积分, 统计时需注意
+        注: cpp 字段单位为 USD/万分 (即每万积分对应多少 USD = cash_usd × 10000 / points),
+            老版本可能是 USD美分/积分 或 本地币*100/积分, 跨版本统计时注意
         """
         if not fetch_date:
             fetch_date = date.today().isoformat()
@@ -299,13 +300,15 @@ if __name__ == "__main__":
             history = db.get_price_history(code.upper(), target_date)
             if history:
                 print(f"{code.upper()} {target_date} 价格历史:")
-                print(f"  {'采集日期':12s} | {'含税价':>8s} | {'积分':>8s} | {'CPP':>6s}")
-                print(f"  {'-'*50}")
+                print(f"  {'采集日期':12s} | {'含税价':>8s} | {'cur':>4s} | {'USD':>7s} | {'积分':>8s} | {'$/万分':>7s}")
+                print(f"  {'-'*65}")
                 for h in history:
                     tax = f"{h['cash_price_after_tax']:.0f}" if h['cash_price_after_tax'] else ""
+                    cur = h['currency'] or ""
+                    usd = f"${h['cash_price_usd']:.0f}" if h['cash_price_usd'] else ""
                     pts = f"{h['points']}" if h['points'] else ""
-                    cpp = f"{h['cpp']:.2f}" if h['cpp'] else ""
-                    print(f"  {h['fetch_date']:12s} | {tax:>8s} | {pts:>8s} | {cpp:>6s}")
+                    cpp = f"${h['cpp']:.0f}" if h['cpp'] else ""
+                    print(f"  {h['fetch_date']:12s} | {tax:>8s} | {cur:>4s} | {usd:>7s} | {pts:>8s} | {cpp:>7s}")
             else:
                 print(f"无记录: {code.upper()} {target_date}")
         else:
