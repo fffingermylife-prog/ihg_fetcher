@@ -1049,6 +1049,9 @@ async def main():
                         help="增量模式: 只获取最远 62 天窗口")
     parser.add_argument("--days", type=int, default=365,
                         help="全量模式查询天数 (默认 365)")
+    parser.add_argument("--window-size", type=int, default=WINDOW_SIZE_DAYS,
+                        help=f"日期窗口大小 (天), 默认 {WINDOW_SIZE_DAYS}. 实验性: 改 90 可减少 33%% 请求数 "
+                             f"(6 窗口 → 4 窗口), 但需先用少量酒店测试 IHG 是否接受 90 天 LOS")
     parser.add_argument("--dry-run", action="store_true",
                         help="只显示变化, 不保存数据")
     parser.add_argument("--proxy", type=str, default=None,
@@ -1089,16 +1092,17 @@ async def main():
             args.proxy = "http://127.0.0.1:7890"
             print(f"[Clash] 自动设置代理: {args.proxy}")
 
-    # 确定日期窗口
+    # 确定日期窗口 (用户可通过 --window-size 调节, 默认 62 天和官网一致)
     start = date.today() + timedelta(days=1)
+    win_size = max(1, args.window_size)
     if args.incremental:
         # 增量模式: 只取最远的一个窗口 (检测新开放)
-        far_start = start + timedelta(days=args.days - WINDOW_SIZE_DAYS)
-        windows = [(far_start.isoformat(), (far_start + timedelta(days=WINDOW_SIZE_DAYS - 1)).isoformat())]
+        far_start = start + timedelta(days=args.days - win_size)
+        windows = [(far_start.isoformat(), (far_start + timedelta(days=win_size - 1)).isoformat())]
         mode_str = "增量"
     else:
         # 全量模式
-        windows = iter_date_windows(start, args.days, WINDOW_SIZE_DAYS)
+        windows = iter_date_windows(start, args.days, win_size)
         mode_str = "全量"
 
     # 批次大小: 启用 Clash 时按 rotate_every_n 切批, 否则一批跑完
@@ -1112,7 +1116,7 @@ async def main():
     print("=" * 80)
     print(f"  IHG 批量价格监控")
     print(f"  模式: {mode_str} | 并发: {concurrency} Tab | 酒店: {len(hotel_codes)} 个")
-    print(f"  日期: {windows[0][0]} ~ {windows[-1][1]} ({len(windows)} 个窗口)")
+    print(f"  日期: {windows[0][0]} ~ {windows[-1][1]} ({len(windows)} 个窗口, 每窗 {win_size} 天)")
     print(f"  每酒店请求: 现金 {len(windows)} 次 + 积分 {len(windows)} 次")
     if clash_mgr:
         print(f"  批次模式: 每批 {batch_size} 个酒店 → 关 context + 切节点 + 重建 (估 {est_batches} 批)")
