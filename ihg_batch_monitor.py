@@ -388,22 +388,48 @@ def parse_points(response_data):
 
 # ============ 单酒店获取逻辑 ============
 
-async def fetch_hotel_prices(page, hotel_code, windows):
-    """获取单个酒店的全部价格 (现金+积分), 返回合并后的列表"""
+async def fetch_hotel_prices(page, hotel_code, windows, burst=False):
+    """获取单个酒店的全部价格 (现金+积分), 返回合并后的列表
+
+    Args:
+        burst: 同窗口的 cash+points 请求并发发起 (asyncio.gather), 总轮次减半.
+            提速 ~50%, 但项目历史经验过同 BrowserContext 多 fetch 并发会触发
+            Akamai 限流, 实际效果需用小批量酒店实测验证错误率.
+    """
     all_cash = []
     all_points = []
 
-    # 获取现金价格
-    for ws, we in windows:
-        resp = await fetch_calendar(page, hotel_code, ws, we, points_mode=False)
-        all_cash.extend(parse_cash(resp))
-        await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
+    if burst:
+        # === burst 模式: 每窗口 cash+points 同时发起, 6 轮 → 6 并发回合 ===
+        # 一个 page 内同时发起 2 个 fetch (cash+points), 总并发数 = 3 Tab × 2 = 6
+        # 注意: page.evaluate 通过 Playwright protocol 顺序送达浏览器, 但浏览器内
+        #       fetch promise 是真并发, 实测启动间隔 < 10ms, 几乎完全并发
+        for ws, we in windows:
+            cash_resp, pts_resp = await asyncio.gather(
+                fetch_calendar(page, hotel_code, ws, we, points_mode=False),
+                fetch_calendar(page, hotel_code, ws, we, points_mode=True),
+                return_exceptions=True,
+            )
+            # 任一异常就当本窗口失败 (让外层重试机制接管)
+            if isinstance(cash_resp, Exception) or isinstance(pts_resp, Exception):
+                exc = cash_resp if isinstance(cash_resp, Exception) else pts_resp
+                raise exc
+            all_cash.extend(parse_cash(cash_resp))
+            all_points.extend(parse_points(pts_resp))
+            await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
+    else:
+        # === 默认串行模式 (稳妥): 6 cash + 6 points = 12 轮 ===
+        # 获取现金价格
+        for ws, we in windows:
+            resp = await fetch_calendar(page, hotel_code, ws, we, points_mode=False)
+            all_cash.extend(parse_cash(resp))
+            await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
 
-    # 获取积分价格
-    for ws, we in windows:
-        resp = await fetch_calendar(page, hotel_code, ws, we, points_mode=True)
-        all_points.extend(parse_points(resp))
-        await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
+        # 获取积分价格
+        for ws, we in windows:
+            resp = await fetch_calendar(page, hotel_code, ws, we, points_mode=True)
+            all_points.extend(parse_points(resp))
+            await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
 
     # 合并
     cash_map = {c["date"]: c for c in all_cash}
@@ -620,7 +646,7 @@ def save_prices(hotel_code, prices, days_queried):
 # ============ 并发 Worker ============
 
 async def worker(worker_id, page, batch_queue, results, requeue, windows, dry_run,
-                 abort_event, failure_counter, abort_threshold):
+                 abort_event, failure_counter, abort_threshold, burst=False):
     """并发 worker (批次模式): 从批次队列取酒店, 跑完即写入 results;
     本批累计失败次数达到 abort_threshold 才触发整批中止 (避免单个酒店瞬时
     问题导致整批白跑)。
@@ -657,7 +683,7 @@ async def worker(worker_id, page, batch_queue, results, requeue, windows, dry_ru
             while retries <= MAX_RETRIES:
                 try:
                     prices = await asyncio.wait_for(
-                        fetch_hotel_prices(page, hotel_code, windows),
+                        fetch_hotel_prices(page, hotel_code, windows, burst=burst),
                         timeout=120
                     )
                     success = True
@@ -727,7 +753,7 @@ async def worker(worker_id, page, batch_queue, results, requeue, windows, dry_ru
 
 
 async def run_batch(playwright, batch_codes, total_index_map, concurrency, windows,
-                    dry_run, launch_opts):
+                    dry_run, launch_opts, burst=False):
     """跑一个批次: 启动新 BrowserContext → 多 worker 并发 → 关 context
 
     重要: 每个批次绑定一个 Clash 节点。本函数生命周期内 context 全程使用同一个
@@ -799,7 +825,7 @@ async def run_batch(playwright, batch_codes, total_index_map, concurrency, windo
         failure_counter = [0]
         worker_tasks = [
             worker(i + 1, page, batch_queue, results, requeue, windows, dry_run,
-                   abort_event, failure_counter, ABORT_THRESHOLD)
+                   abort_event, failure_counter, ABORT_THRESHOLD, burst=burst)
             for i, page in enumerate(pages)
         ]
         await asyncio.gather(*worker_tasks)
@@ -1067,6 +1093,10 @@ async def main():
                         help="代理地址 (如 http://127.0.0.1:7890)")
     parser.add_argument("--auto-switch", action="store_true",
                         help="启用 Clash 自动切换节点 (需配置 notify_config.json 中 clash 字段)")
+    parser.add_argument("--window-size", type=int, default=WINDOW_SIZE_DAYS,
+                        help=f"日期窗口大小 (天), 默认 {WINDOW_SIZE_DAYS}. 实验性: 改 90 可减少 33%% 请求数, 但需测试 IHG 是否接受")
+    parser.add_argument("--burst", action="store_true",
+                        help="实验性提速: 同酒店 cash/points 请求并发发起 (~50%% 提速). 风险: 可能触发 Akamai 限流, 建议先用少量酒店测试")
     args = parser.parse_args()
 
     # 限制并发数
@@ -1103,14 +1133,15 @@ async def main():
 
     # 确定日期窗口
     start = date.today() + timedelta(days=1)
+    win_size = max(1, args.window_size)  # 用户可调, 默认 62
     if args.incremental:
         # 增量模式: 只取最远的一个窗口 (检测新开放)
-        far_start = start + timedelta(days=args.days - WINDOW_SIZE_DAYS)
-        windows = [(far_start.isoformat(), (far_start + timedelta(days=WINDOW_SIZE_DAYS - 1)).isoformat())]
+        far_start = start + timedelta(days=args.days - win_size)
+        windows = [(far_start.isoformat(), (far_start + timedelta(days=win_size - 1)).isoformat())]
         mode_str = "增量"
     else:
         # 全量模式
-        windows = iter_date_windows(start, args.days, WINDOW_SIZE_DAYS)
+        windows = iter_date_windows(start, args.days, win_size)
         mode_str = "全量"
 
     # 批次大小: 启用 Clash 时按 rotate_every_n 切批, 否则一批跑完
@@ -1124,14 +1155,17 @@ async def main():
     print("=" * 80)
     print(f"  IHG 批量价格监控")
     print(f"  模式: {mode_str} | 并发: {concurrency} Tab | 酒店: {len(hotel_codes)} 个")
-    print(f"  日期: {windows[0][0]} ~ {windows[-1][1]} ({len(windows)} 个窗口)")
-    print(f"  每酒店请求: 现金 {len(windows)} 次 + 积分 {len(windows)} 次")
+    print(f"  日期: {windows[0][0]} ~ {windows[-1][1]} ({len(windows)} 个窗口, 每窗 {win_size} 天)")
+    req_per_hotel = len(windows) if args.burst else len(windows) * 2
+    burst_label = " [BURST 模式]" if args.burst else ""
+    print(f"  每酒店请求: {req_per_hotel} 次{burst_label}")
     if clash_mgr:
         print(f"  批次模式: 每批 {batch_size} 个酒店 → 关 context + 切节点 + 重建 (估 {est_batches} 批)")
     else:
         print(f"  单批模式: 直连无切换")
     # 预估耗时: 抓取耗时 + 每批重建 context 约 8 秒开销
-    est_fetch = len(hotel_codes) * len(windows) * 2 * (sum(REQUEST_DELAY_MS) / 2 / 1000) / concurrency
+    fetch_rounds = len(windows) if args.burst else len(windows) * 2
+    est_fetch = len(hotel_codes) * fetch_rounds * (sum(REQUEST_DELAY_MS) / 2 / 1000) / concurrency
     est_overhead = est_batches * 8 if clash_mgr else 0
     est_time = est_fetch + est_overhead
     print(f"  预估耗时: ~{est_time:.0f}s ({est_time/60:.1f}min)")
@@ -1304,7 +1338,7 @@ async def main():
             try:
                 batch_results, batch_requeue = await run_batch(
                     p, batch, total_index_map, concurrency, windows,
-                    args.dry_run, launch_opts,
+                    args.dry_run, launch_opts, burst=args.burst,
                 )
             except Exception as e:
                 # run_batch 自身崩溃 (极少): 整批 requeue, 切节点重试
