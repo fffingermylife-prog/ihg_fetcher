@@ -15,6 +15,11 @@
 - 输出字段：mnemonic, name, brand_code, city, country, address, rating, review_count, url
 - 结果按国家分组 + 评分排序
 - 同时写入 SQLite 数据库
+- **国家归一化** (`resolve_country()`)：兼容两种区域展开结构
+    - 国家级 (Asia/Europe/...): "Vietnam Hotels" → country="Vietnam"
+    - **州/省级 (US & Canada): "Alabama Hotels" → "United States"，"Ontario Hotels" → "Canada"**
+    - 内置 50 美国州 + DC、加拿大 10 省 + 3 领地查询表；Puerto Rico/Guam/USVI 等领土保持原样
+- **历史数据迁移** `--fix-country`：一次性把 DB 里误存为州/省名的 country 字段批量回写为 "United States"/"Canada"，运行后退出（不抓取）
 
 ### 2. 多酒店批量监控 (`ihg_batch_monitor.py`)
 - 多 Tab 并发 (默认 3, 最大 3)
