@@ -102,12 +102,22 @@ def load_hotel_codes(args):
 
     elif args.from_csv:
         try:
-            with open(args.from_csv, "r", encoding="utf-8") as f:
+            # utf-8-sig 兼容 Excel 导出的 BOM 头, 避免第一列名变成 "\ufeffmnemonic"
+            with open(args.from_csv, "r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames or []
+                if "mnemonic" not in fieldnames:
+                    print(f"[!] CSV 缺少 'mnemonic' 列, 实际列名: {fieldnames}")
+                    print(f"    请确认 {args.from_csv} 表头有 mnemonic 这一列")
+                    return []
                 for row in reader:
-                    code = row.get("mnemonic", "").strip().upper()
+                    code = (row.get("mnemonic") or "").strip().upper()
                     if code:
                         codes.append(code)
+                if not codes:
+                    print(f"[!] CSV {args.from_csv} 已读取, 但 mnemonic 列全部为空")
+        except FileNotFoundError:
+            print(f"[!] CSV 文件不存在: {args.from_csv} (当前目录下找不到, 请检查路径)")
         except Exception as e:
             print(f"[!] 读取 CSV 失败: {e}")
 
