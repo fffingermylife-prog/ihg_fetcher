@@ -280,8 +280,9 @@ class ClashProxyManager:
         """
         请求失败时调用 (仅记录失败次数, 不再立即切换节点)
 
-        在批次重建模式下, 失败由主流程通过 abort_event 触发批次中断 →
-        关 context → 切节点 → 重建 context, 而不是在 worker 内直接切换。
+        Step 2 优化后的批次模式: 单个酒店失败不再中止整批 (失败延迟集中重试),
+        失败酒店进入 requeue 后续批次重试; 主流程在每批结束后正常 rotate() 切节点,
+        因此 on_failure 在此处只是计数, 不主动切换.
         """
         self.fail_count += 1
         return False
