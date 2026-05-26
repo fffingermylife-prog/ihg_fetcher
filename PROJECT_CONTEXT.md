@@ -33,6 +33,8 @@
 - **详细日志写文件**: `./ihg_logs/monitor_YYYYMMDD_HHMMSS.log`
 - SQLite 存储 (保留所有历史记录)
 - 自动触发微信通知 (满足告警条件时)
+- **Step 2 失败延迟集中重试** (✨ 新增): 单酒店失败不再中止整批, 失败酒店放入 requeue 进入下批次 (新节点) 重试; main 中 MAX_BATCH_ATTEMPTS=3 防无限循环
+- **Step 3 同酒店现金/积分配对并发** (✨ 新增): `fetch_hotel_prices` 内 `asyncio.gather` 同窗口同时发现金+积分 2 个 fetch, 单酒店耗时从 ~8s 降到 ~4s (节省 ~50%)
 
 ### 3. SQLite 数据库 (`ihg_db.py`)
 - `hotels` 表: 酒店基本信息 (从 hotel_list_fetcher 写入)
@@ -133,6 +135,17 @@ if cpp >= min_cpp and points and points_ok and cash_ok:
 - 内容: 所有满足 file 阈值的告警 (不限条数), 按权重降序, 按酒店分组
 - 与推送的关系: 全量文件 ⊇ 推送 (推送是全量经 push 阈值过滤 + top_n_global)
 - 用途: 回查历史触发情况, 调整阈值参考
+
+#### 4.9 积分预算上限 `max_points_per_night` (✨ 新增)
+- 默认值: **35000 分/晚** (后期可调)
+- 作用范围: 仅 4 条积分规则 (💎🟢🟠🔴), 现金规则 (🟣🟡) 不受影响
+- 过滤位置: **仅 push 阶段** (`passes_push_threshold`), file 阶段不受影响
+  - 全量 `alerts_*.md` 仍记录所有 file 阈值触发的告警 (含 70000 分等高积分酒店)
+  - 仅 Server酱 微信推送拦截高积分告警, 减少打扰
+- 实现细节:
+  - `filter_alerts` 中 4 条积分规则 alert dict 加 `"points": <值>` 字段
+  - `passes_push_threshold` 开头检查 `alert["level"] in {💎🟢🟠🔴} and points > max_points → return False`
+- 设计意图: 高积分酒店 (如 70000 分/晚 IC 顶级) 性价比再高也对小积分玩家不可达, 不必打扰推送; 但仍写文件保留, 积分储备充足时可参考
 
 ### 5. Clash 代理自动切换 (`ihg_clash_proxy.py`)
 - 通过 Clash RESTful API 自动切换节点
@@ -284,6 +297,9 @@ if cpp >= min_cpp and points and points_ok and cash_ok:
 | 💎 高 CPP 推送了 bug 价日期 | 现金价异常高 (IHG 数据错误) → CPP 虚高 | **双重过滤**: 积分 ≤ 平日均价 + 现金 ≤ 平日均价×1.5 |
 | 平日积分 bug 价无法捕捉 | 旧规则 🟠 只在节假日触发 | **新增 🟢 积分深折扣规则**, 任意日期触发 |
 | 推送过多无差别噪音 | 单一阈值, 触发即推 | **三层阈值制**: file 入文件 + push 推送 + top_n_global |
+| 高积分酒店 (70000 分/晚) 推送对小积分玩家不可达 | CPP 高但门槛过高, 全量过滤又会丢失数据 | `max_points_per_night=35000` **仅 push 阶段过滤**, file 全量保留供回查 |
+| 单酒店失败立刻 abort 整批 → 浪费 7 个酒店进度 + 1 次 context 重建 | 旧设计: 任一失败立刻 set abort_event | **Step 2 失败延迟集中重试**: worker 仅 requeue, 失败酒店进入下批新节点重试 |
+| 单酒店现金 6 + 积分 6 = 12 次串行, 单酒店 ~8s | 早期保守串行避开 Akamai 限流 | **Step 3 同酒店现金/积分配对并发**: `asyncio.gather` 同 page 2 路 fetch, 单酒店 ~4s |
 
 ---
 
@@ -318,6 +334,7 @@ fffingermylife-prog/ihg_fetcher (分支: feat/ihg-calendar-price)
     "holiday_points_ratio": 0.9,         "holiday_points_push_ratio": 0.7,
     "cash_deal_ratio": 0.5,              "cash_deal_push_ratio": 0.4,
     "cash_drop_pct": 50,                 "cash_drop_push_pct": 60,
+    "max_points_per_night": 35000,
     "top_n_global": 30
   },
   "hotels": {
@@ -416,3 +433,7 @@ python ihg_detect_open_time.py --code HKGKL
 - **💎 双重 bug 过滤**: 积分 ≤ 平日均价 + 现金 ≤ 平日均价×1.5 (排除现金/积分异常导致的 CPP 虚高)
 - **节假日缓冲**: 单天假期 (元旦/清明/端午/中秋) 不加缓冲, 长假 (春节/五一/国庆 ≥3天) 加前后 2 天
 - **阈值调优指引**: 推送多噪音 → 提高 push 阈值; 漏掉好货 → 看全量 `alerts_*.md` 文件回查
+- **`max_points_per_night=35000`**: 4 条积分规则 (💎🟢🟠🔴) 推送阶段额外过滤; 现金规则 🟣🟡 不受影响; 全量 `alerts_*.md` 不过滤, 高积分酒店仍可回查
+- **失败延迟集中重试 (Step 2)**: 单酒店失败仅 requeue, 不再 abort 整批; 失败酒店随主流程进入下批 (新节点) 重试; MAX_BATCH_ATTEMPTS=3 防无限循环
+- **同酒店现金/积分配对并发 (Step 3)**: `fetch_hotel_prices` 内 `asyncio.gather` 同窗口 2 路 fetch (现金+积分); 单酒店耗时砍半 ~8s → ~4s; 仍受 Akamai 限制 (≤2 路同 page 并发, 项目历史已验证 6 路并发会被限流)
+- **未实施的进一步优化** (用户已明确不做): Tier 分层 / 缩天数 (维持全量 365 天 × 全部酒店); 待验证: Step 1 (rotate_every_n 8→16) 和 Step 4 (请求间隔 100~300ms) 用户可随时手动调参

@@ -17,6 +17,7 @@
     "cash_deal_push_ratio": "🟣 push: 现金USD <= 平日均价×此值才推送 (0.4 = 60%折扣)",
     "cash_drop_pct": "🟡 file: 同日现金降幅 >= 此百分比入文件",
     "cash_drop_push_pct": "🟡 push: 同日现金降幅 >= 此百分比才推送",
+    "max_points_per_night": "积分预算上限: 单晚积分 > 此值的积分类告警仅推送被过滤, 不推 Server酱 (但仍写入全量 alerts_*.md 供回查). 仅作用于💎🟢🟠🔴 4条积分规则, 现金🟣🟡不受影响. 35000 = 排除 70000 分这种高门槛酒店",
     "top_n_global": "全局推送 top N 条 (按权重降序), 默认 30"
   },
   "rules": {
@@ -32,6 +33,7 @@
     "cash_deal_push_ratio": 0.4,
     "cash_drop_pct": 50,
     "cash_drop_push_pct": 60,
+    "max_points_per_night": 35000,
     "top_n_global": 30
   },
 

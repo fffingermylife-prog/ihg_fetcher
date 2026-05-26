@@ -59,6 +59,12 @@ DEFAULT_RULES = {
     "cash_drop_push_pct": 60,             # 🟡 推送: 同日降幅 ≥ 60%
     "points_deep_discount_push_ratio": 0.4,  # 🟢 推送: 积分 ≤ 平日均价×0.4 (60%折扣以下)
 
+    # ===== 积分上限过滤 (仅作用于 push 阶段, 全量文件 alerts_*.md 不受影响) =====
+    # 仅对 4 条积分规则 (💎🟢🟠🔴) 生效, 现金规则 (🟣🟡) 不受影响
+    # 设计意图: 高积分酒店性价比再高, 70000 分/晚的成本对小积分玩家也不可达, 不打扰推送;
+    #          但仍写入全量 alerts_*.md 供日后回查 (积分储备充足时可参考)
+    "max_points_per_night": 35000,        # 单晚积分 > 此值的告警不推送 Server酱 (后期可调)
+
     # ===== 推送数量 =====
     "top_n_per_hotel": 5,                 # 每酒店预筛上限 (兼容字段, 当前未使用)
     "top_n_global": 30,                   # 全局推送 top N
@@ -248,7 +254,18 @@ def passes_push_threshold(alert, rules):
 
     设计: 全量文件保留所有 file 阈值触发的告警 (供回查),
           推送只发更严的 push 阈值, 减少噪音聚焦真极端。
+
+    积分上限过滤: 4 条积分规则 (💎🟢🟠🔴) 在推送前额外检查 max_points_per_night,
+                  超过预算的高积分酒店即使 CPP 再高也不推送 (但全量文件已记录).
     """
+    # 积分类告警: 推送阶段额外过滤 max_points_per_night
+    POINTS_LEVELS = {"💎", "🟢", "🟠", "🔴"}
+    if alert["level"] in POINTS_LEVELS:
+        max_points = rules.get("max_points_per_night", 35000)
+        alert_points = alert.get("points")
+        if alert_points and alert_points > max_points:
+            return False  # 高积分酒店不推送 (但仍在 alerts_*.md 中可查)
+
     level = alert["level"]
     score = alert.get("score", 0)
 
@@ -304,6 +321,8 @@ def filter_alerts(results, db, config):
         deep_ratio = rules.get("points_deep_discount_ratio", 0.5)
         holiday_ratio = rules.get("holiday_points_ratio", 0.9)
         deal_ratio = rules.get("cash_deal_ratio", 0.5)
+        # 注: max_points_per_night 不在此处过滤, 移到 passes_push_threshold 推送阶段
+        # 这样所有 file 阈值触发的告警 (含高积分酒店) 都会写入 alerts_*.md 供回查
 
         for p in prices:
             d = p.get("date", "")
@@ -326,6 +345,7 @@ def filter_alerts(results, db, config):
                         "detail": f"{points}分 ≈${cash_usd:.0f} CPP={cpp:.2f}¢",
                         "score": cpp,
                         "threshold": min_cpp,
+                        "points": points,  # 用于 push 阶段 max_points 过滤
                     })
 
             # 🟢 积分深折扣 (任意日期, 平日 bug 积分价利器)
@@ -337,6 +357,7 @@ def filter_alerts(results, db, config):
                     "hotel": hotel_code, "label": label, "date": d,
                     "detail": f"{points}分 (-{pct:.0f}%均价{avg_points:.0f}分)",
                     "score": pct,
+                    "points": points,  # 用于 push 阶段 max_points 过滤
                 })
 
             # 🟠 节假日积分低价
@@ -348,9 +369,10 @@ def filter_alerts(results, db, config):
                     "hotel": hotel_code, "label": label, "date": d,
                     "detail": f"{points}分 (-{pct:.0f}%均价) {get_holiday_name(d)}",
                     "score": pct,
+                    "points": points,  # 用于 push 阶段 max_points 过滤
                 })
 
-            # 🟣 现金深折扣
+            # 🟣 现金深折扣 (现金规则, 不受 max_points 约束)
             if cash_usd and avg_cash_usd and cash_usd <= avg_cash_usd * deal_ratio:
                 pct = (1 - cash_usd / avg_cash_usd) * 100
                 hotel_snapshot_alerts.append({
@@ -370,7 +392,7 @@ def filter_alerts(results, db, config):
             if not d or d <= today_str:
                 continue
 
-            # 🔴 积分同日暴降
+            # 🔴 积分同日暴降 (file 阶段不卡 max_points, 推送阶段再卡)
             if c["type"] == "积分降":
                 pct = abs(c.get("pct", 0))
                 if pct >= rules.get("points_drop_pct", 40):
@@ -380,6 +402,7 @@ def filter_alerts(results, db, config):
                         "hotel": hotel_code, "label": label, "date": d,
                         "detail": f"{c['old_value']}→{c['new_value']}分 (-{pct:.0f}%)",
                         "score": pct,
+                        "points": c.get("new_value"),  # 用于 push 阶段 max_points 过滤
                     })
             # 🟡 现金同日暴降
             elif c["type"] == "现金降":

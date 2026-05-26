@@ -3,6 +3,8 @@ IHG 多酒店批量价格监控 - 并发高效版
 
 特性:
     - 多 Tab 并发 (默认 2, 最大 3), 大幅提升效率
+    - 单酒店现金/积分配对并发 (Step 3): 同窗口同时发 2 个 fetch, 单酒店耗时砍半
+    - 失败延迟集中重试 (Step 2): 单个酒店失败不中止整批, 失败酒店进入 requeue 后续批次重试
     - 全量模式: 获取 365 天完整价格, 对比所有变化
     - 增量模式: 只获取最远 62 天窗口, 快速检测新开放日期
     - 房态检测: 售罄/重新开放/积分房售罄
@@ -366,20 +368,24 @@ def parse_points(response_data):
 # ============ 单酒店获取逻辑 ============
 
 async def fetch_hotel_prices(page, hotel_code, windows):
-    """获取单个酒店的全部价格 (现金+积分), 返回合并后的列表"""
+    """获取单个酒店的全部价格 (现金+积分), 返回合并后的列表
+
+    Step 3 优化: 同窗口的现金和积分请求并发发送 (asyncio.gather → 同 page 内 2 路 fetch 同时执行)
+    - 项目历史: 同 page 6 路并发会被 Akamai 限流, 但 2 路并发安全 (有头浏览器 + 完整 session)
+    - 单酒店耗时: 旧版 12 次串行 ~8s → 新版 6 次配对并发 ~4s, 节省 ~50%
+    - wait_for_timeout 也从 12 次降到 6 次 (每对配对之间一次)
+    """
     all_cash = []
     all_points = []
 
-    # 获取现金价格
+    # 现金 + 积分配对并发: 每个窗口同时发 2 个请求, 等两者都返回再进入下一窗口
     for ws, we in windows:
-        resp = await fetch_calendar(page, hotel_code, ws, we, points_mode=False)
-        all_cash.extend(parse_cash(resp))
-        await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
-
-    # 获取积分价格
-    for ws, we in windows:
-        resp = await fetch_calendar(page, hotel_code, ws, we, points_mode=True)
-        all_points.extend(parse_points(resp))
+        cash_resp, points_resp = await asyncio.gather(
+            fetch_calendar(page, hotel_code, ws, we, points_mode=False),
+            fetch_calendar(page, hotel_code, ws, we, points_mode=True),
+        )
+        all_cash.extend(parse_cash(cash_resp))
+        all_points.extend(parse_points(points_resp))
         await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
 
     # 合并
@@ -597,14 +603,18 @@ def save_prices(hotel_code, prices, days_queried):
 # ============ 并发 Worker ============
 
 async def worker(worker_id, page, batch_queue, results, requeue, windows, dry_run, abort_event):
-    """并发 worker (批次模式): 从批次队列取酒店, 跑完即写入 results;
-    任何失败立即触发 abort_event 通知主流程关 context 重建。
+    """并发 worker (批次模式 + Step 2 失败延迟集中重试): 从批次队列取酒店, 跑完写入 results.
+
+    Step 2 优化前: 任一酒店失败 → set abort_event → 整批中止 → 切节点重建.
+    Step 2 优化后: 单酒店失败仅放入 requeue, 本批继续跑;
+                   失败酒店随主流程 remaining = requeue + remaining 进入下个批次重试.
+                   abort_event 仅保留给真正灾难性场景 (worker 被外部 cancel 等).
 
     Args:
         batch_queue: 仅含本批次酒店的 asyncio.Queue, 元素 (idx, code, total)
         results: 成功结果会 append 到这个 list (主流程共享)
         requeue: 失败/未完成的酒店 code 会 append 到这个 list, 主流程下批重试
-        abort_event: 任一 worker 检测到失败 → set; 其他 worker 跑完手头任务即退出
+        abort_event: 仅在 worker 灾难性 cancel 时 set; 一般失败不再触发
     """
     while True:
         # 1. 检查批次是否已被通知中止
@@ -641,14 +651,14 @@ async def worker(worker_id, page, batch_queue, results, requeue, windows, dry_ru
                         print(f"  [W{worker_id}] {label} 超时, 重试 ({retries}/{MAX_RETRIES})...")
                         await page.wait_for_timeout(random.randint(3000, 5000))
                     else:
-                        print(f"  [W{worker_id}] {label} 超时, 触发批次重建")
+                        print(f"  [W{worker_id}] {label} 超时, 加入重试队列")
                 except Exception as e:
                     retries += 1
                     if retries <= MAX_RETRIES:
                         print(f"  [W{worker_id}] {label} 失败, 重试 ({retries}/{MAX_RETRIES})...")
                         await page.wait_for_timeout(random.randint(2000, 4000))
                     else:
-                        print(f"  [W{worker_id}] {label} 失败, 触发批次重建: {str(e)[:100]}")
+                        print(f"  [W{worker_id}] {label} 失败, 加入重试队列: {str(e)[:100]}")
 
             elapsed = time.time() - t0
 
@@ -677,14 +687,19 @@ async def worker(worker_id, page, batch_queue, results, requeue, windows, dry_ru
                 print(f"  [{idx}/{total_count}] {label} ✓ {elapsed:.1f}s ({len(prices)}天, {status})")
                 completed = True
             else:
-                # 失败: 放回 requeue 让下个批次 (新节点) 重试, 并触发整批中止
+                # 失败延迟集中重试 (Step 2 优化):
+                # 单个酒店失败不再中止整批, 只放回 requeue 等下个批次 (新节点) 重试.
+                # 这避免了"一颗老鼠屎坏一锅汤" — 之前任一失败 → abort → 整批 7 个酒店白等.
+                # 失败酒店通过 main 循环的 remaining = requeue + remaining 自然进入下批,
+                # 下批 clash_mgr.rotate() 切节点, 失败酒店用新节点重试.
+                # 安全网: main 中 MAX_BATCH_ATTEMPTS=3 防止某个酒店无限循环.
                 requeue.append(hotel_code)
-                abort_event.set()
-                print(f"  [{idx}/{total_count}] {label} ✗ {elapsed:.1f}s (失败, 已触发批次重建)")
+                print(f"  [{idx}/{total_count}] {label} ✗ {elapsed:.1f}s (失败, 已加入重试队列)")
                 completed = True
         finally:
             # 兜底: 如果 worker 被外部 cancel 或抛出未捕获异常,
-            # 当前任务也要放回 requeue, 避免酒店被吞掉
+            # 当前任务也要放回 requeue, 避免酒店被吞掉.
+            # 这是真正的灾难性退出 (asyncio.CancelledError 等), 才会触发 abort_event.
             if not completed:
                 requeue.append(hotel_code)
                 abort_event.set()
@@ -1089,8 +1104,11 @@ async def main():
         print(f"  批次模式: 每批 {batch_size} 个酒店 → 关 context + 切节点 + 重建 (估 {est_batches} 批)")
     else:
         print(f"  单批模式: 直连无切换")
-    # 预估耗时: 抓取耗时 + 每批重建 context 约 8 秒开销
-    est_fetch = len(hotel_codes) * len(windows) * 2 * (sum(REQUEST_DELAY_MS) / 2 / 1000) / concurrency
+    # 预估耗时 (Step 3 优化后):
+    # - 单酒店现金+积分配对并发, 每对耗时 ~ max(cash, points) ≈ 单次请求时间
+    # - 总等待数从 len(windows)*2 降到 len(windows) (每对配对之间一次)
+    # - 因此 est_fetch 公式相比旧版砍半 (旧公式: len(windows)*2 * delay_avg)
+    est_fetch = len(hotel_codes) * len(windows) * (sum(REQUEST_DELAY_MS) / 2 / 1000) / concurrency
     est_overhead = est_batches * 8 if clash_mgr else 0
     est_time = est_fetch + est_overhead
     print(f"  预估耗时: ~{est_time:.0f}s ({est_time/60:.1f}min)")
