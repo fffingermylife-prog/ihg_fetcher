@@ -35,6 +35,10 @@
 - 自动触发微信通知 (满足告警条件时)
 - **Step 2 失败延迟集中重试** (✨ 新增): 单酒店失败不再中止整批, 失败酒店放入 requeue 进入下批次 (新节点) 重试; main 中 MAX_BATCH_ATTEMPTS=3 防无限循环
 - **Step 3 同酒店现金/积分配对并发** (✨ 新增): `fetch_hotel_prices` 内 `asyncio.gather` 同窗口同时发现金+积分 2 个 fetch, 单酒店耗时从 ~8s 降到 ~4s (节省 ~50%)
+- **请求间隔降低** (✨ Step 4): `REQUEST_DELAY_MS (200,500)→(150,350)ms` + session warmup `1-2s→0.8-1.5s`, 500 酒店总省 ~3 min
+- **`--window-size` 参数** (✨ Step 5): 默认 62 (与官网一致), 可调 90 → 6 窗口变 4 窗口减 33% 请求数 (实验性, 用户需先小批量验证 IHG 是否接受 90 天 LOS)
+- **主循环 3 道死循环防护** (✨ Step 6): processed_codes 集合 + MAX_TOTAL_ITERATIONS 上限 + 进度停滞检测, 防 actually_requeue 异常导致已完结酒店反复进入批次
+- **CSV BOM 兼容**: `encoding='utf-8-sig'` 解决 Excel 导出 BOM 头导致 mnemonic 列读不到; 配合详细错误诊断, 不再静默返回空列表
 
 ### 3. SQLite 数据库 (`ihg_db.py`)
 - `hotels` 表: 酒店基本信息 (从 hotel_list_fetcher 写入)
@@ -113,6 +117,12 @@ if cpp >= min_cpp and points and points_ok and cash_ok:
 - 每个币种汇率仅查询一次 (run-level 缓存)
 - CPP 全球可比, 不再被本地币面值 (如 MYR/JPY) 误导
 - 通知中只显示 USD 价 (精简格式)
+- **优先取 source=P** (✨ 关键修复): IHG 接口对 CNY/EUR 等品牌定制汇率会同时返回:
+  - `source=K` (品牌专用, **可能 stale** — 实测 CNY 停在 2022-11 的 11.4745)
+  - `source=P` (官方主源, 当前实时 — CNY 实测 0.14649)
+  - 旧代码取 `results[0]` 拿到 K 值导致大陆酒店 cash_price_usd 虚高 ~78 倍 → 💎 大量误推
+  - 修复: 优先取 `source=P`, fallback 第 0 条; 加 sanity check `1e-7 < rate < 5` 挡住所有异常 stale
+  - **历史污染数据**: 用 `python fix_currency_rates.py` 一次性修复 (拉新汇率 → 自动备份 → 按币种批量重算 cash_price_usd 和 cpp; 支持 `--dry-run` 预览)
 
 #### 4.5 基准均价策略
 - 统一用本次快照平日均价 (周一~周四 + 非节假日)
@@ -300,6 +310,9 @@ if cpp >= min_cpp and points and points_ok and cash_ok:
 | 高积分酒店 (70000 分/晚) 推送对小积分玩家不可达 | CPP 高但门槛过高, 全量过滤又会丢失数据 | `max_points_per_night=35000` **仅 push 阶段过滤**, file 全量保留供回查 |
 | 单酒店失败立刻 abort 整批 → 浪费 7 个酒店进度 + 1 次 context 重建 | 旧设计: 任一失败立刻 set abort_event | **Step 2 失败延迟集中重试**: worker 仅 requeue, 失败酒店进入下批新节点重试 |
 | 单酒店现金 6 + 积分 6 = 12 次串行, 单酒店 ~8s | 早期保守串行避开 Akamai 限流 | **Step 3 同酒店现金/积分配对并发**: `asyncio.gather` 同 page 2 路 fetch, 单酒店 ~4s |
+| 大陆酒店 cash_price_usd 虚高 78 倍 → 💎 大量误推 (CNY=11.47) | IHG 汇率 API 对 CNY 同时返回 `source=K` (stale 2022-11 旧值 11.4745) 和 `source=P` (实时 0.14649); 旧代码 `results[0]` 拿到 K | **优先取 `source=P`** + sanity check `1e-7 < rate < 5`; 历史污染数据用 `fix_currency_rates.py` 重算 |
+| 500+ 酒店跑完后偶尔重新循环 | `actually_requeue` 异常含已 success 酒店, 让其再进 remaining | **3 道死循环防护**: processed_codes 双重过滤 + MAX_TOTAL_ITERATIONS 上限 + 连续 5 批进度停滞强制结束 |
+| Excel 导出 CSV 无法读取酒店 (mnemonic 列读到空) | utf-8 编码下 Excel 加 BOM 头, 第一列名变成 `\ufeffmnemonic` | encoding 改 `utf-8-sig` + fieldnames 检测 + FileNotFoundError 单独提示, 不再静默 |
 
 ---
 
@@ -313,6 +326,7 @@ fffingermylife-prog/ihg_fetcher (分支: feat/ihg-calendar-price)
 ├── ihg_clash_proxy.py           # 核心: Clash 代理节点切换
 ├── ihg_db.py                    # 核心: SQLite 数据库封装
 ├── ihg_detect_open_time.py      # 工具: 新日期开放时间探测
+├── fix_currency_rates.py        # 工具: 一次性修复 DB 被 source=K stale 汇率污染的历史数据
 ├── notify_config.json           # 配置: Server酱 key + 6规则三层阈值 + Clash
 ├── .gitignore                   # 忽略 ihg_data/ ihg_logs/ ihg_browser_profile/
 ├── requirements.txt             # 依赖: playwright, requests
@@ -387,6 +401,13 @@ python ihg_notify.py --url HKGKL:2026-10-01:2
 
 # 10. 探测新日期开放时间
 python ihg_detect_open_time.py --code HKGKL
+
+# 11. 一次性修复 DB 历史汇率污染数据 (CNY 等被 source=K stale 值污染)
+python fix_currency_rates.py --dry-run    # 先预览影响范围
+python fix_currency_rates.py              # 实际修复 (会自动备份 DB)
+
+# 12. 实验性提速: 窗口大小调到 90, 减 33% 请求数
+python ihg_batch_monitor.py --codes DADHA,HKGKL --window-size 90 --auto-switch
 ```
 
 ---
@@ -436,4 +457,8 @@ python ihg_detect_open_time.py --code HKGKL
 - **`max_points_per_night=35000`**: 4 条积分规则 (💎🟢🟠🔴) 推送阶段额外过滤; 现金规则 🟣🟡 不受影响; 全量 `alerts_*.md` 不过滤, 高积分酒店仍可回查
 - **失败延迟集中重试 (Step 2)**: 单酒店失败仅 requeue, 不再 abort 整批; 失败酒店随主流程进入下批 (新节点) 重试; MAX_BATCH_ATTEMPTS=3 防无限循环
 - **同酒店现金/积分配对并发 (Step 3)**: `fetch_hotel_prices` 内 `asyncio.gather` 同窗口 2 路 fetch (现金+积分); 单酒店耗时砍半 ~8s → ~4s; 仍受 Akamai 限制 (≤2 路同 page 并发, 项目历史已验证 6 路并发会被限流)
-- **未实施的进一步优化** (用户已明确不做): Tier 分层 / 缩天数 (维持全量 365 天 × 全部酒店); 待验证: Step 1 (rotate_every_n 8→16) 和 Step 4 (请求间隔 100~300ms) 用户可随时手动调参
+- **汇率 source=P 优先 (✨ 关键)**: IHG 接口对 CNY/EUR 等返回 K (stale) + P (实时) 两条; 必须取 P 否则大陆酒店 cash_usd 虚高 78 倍; sanity check `1e-7 < rate < 5` 双保险
+- **历史 DB 修复脚本**: `fix_currency_rates.py` 一次性修正旧版 source=K 污染的 cash_price_usd / cpp; 自动备份 DB, 支持 `--dry-run`
+- **可选提速 flag**: `--window-size 90` (6→4 窗口, 减 33% 请求, 需小批量验证 IHG 接受); `REQUEST_DELAY_MS=(150,350)` 已默认调低
+- **死循环防护**: 主循环 3 道安全锁 (processed_codes / MAX_TOTAL_ITERATIONS / 连续 5 批停滞), 防 actually_requeue 异常导致 500+ 酒店跑完后重新循环
+- **未实施的优化**: Tier 分层 / 缩天数 (维持全量 365 天 × 全部酒店); CPP 单位变更 (USD/万分, 当前用 USD美分/分 已稳定); ABORT_THRESHOLD=2 (Step 2 已超越)
