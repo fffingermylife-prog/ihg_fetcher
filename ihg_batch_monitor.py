@@ -51,7 +51,7 @@ API_KEY = "se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y"
 POINTS_RATE_PLAN_CODES = ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"]
 
 WINDOW_SIZE_DAYS = 62
-REQUEST_DELAY_MS = (200, 500)  # 随机延迟区间 (毫秒)
+REQUEST_DELAY_MS = (150, 350)  # 随机延迟区间 (毫秒) — 调低 ~30% 提速, 仍在浏览器自然请求间隔范围
 MAX_RETRIES = 1
 
 # 数据目录
@@ -766,7 +766,8 @@ async def run_batch(playwright, batch_codes, total_index_map, concurrency, windo
         for i, page in enumerate(pages):
             try:
                 await page.goto(SEED_URL, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(random.randint(1000, 2000))
+                # 提速: session warmup 等待时间 1-2s -> 0.8-1.5s, 实测 Akamai cookie 落地够用
+                await page.wait_for_timeout(random.randint(800, 1500))
                 print(f"    Tab {i+1} session 就绪 ✓")
             except Exception as e:
                 print(f"    Tab {i+1} session 建立失败: {str(e)[:80]}")
