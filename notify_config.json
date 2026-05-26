@@ -5,8 +5,8 @@
 
   "_rules_说明": {
     "_三层阈值": "file 阈值 (xxx_threshold/xxx_ratio): 入全量文件 ihg_logs/alerts_*.md | push 阈值 (xxx_push): 推送 Server酱微信 | top_n_global: 全局取前 N 条推送",
-    "min_cpp_threshold": "💎 file: CPP >= 此值入文件 (USD美分/积分, 0.8 = 每万积分价值$80以上)",
-    "min_cpp_push": "💎 push: CPP >= 此值才推送 (1.0 = 每万积分价值$100以上)",
+    "min_cpp_threshold": "💎 file: CPP >= 此值入文件 (单位 USD/万分, 80 = 每万积分价值$80以上)",
+    "min_cpp_push": "💎 push: CPP >= 此值才推送 (100 = 每万积分价值$100以上)",
     "points_deep_discount_ratio": "🟢 file: 积分 <= 平日均价×此值入文件 (0.5 = 五折以下, 任意日期)",
     "points_deep_discount_push_ratio": "🟢 push: 积分 <= 平日均价×此值才推送 (0.4 = 四折以下, 平日积分bug价利器)",
     "points_drop_pct": "🔴 file: 同日积分降幅 >= 此百分比入文件",
@@ -20,8 +20,8 @@
     "top_n_global": "全局推送 top N 条 (按权重降序), 默认 30"
   },
   "rules": {
-    "min_cpp_threshold": 0.8,
-    "min_cpp_push": 1.0,
+    "min_cpp_threshold": 80,
+    "min_cpp_push": 100,
     "points_deep_discount_ratio": 0.5,
     "points_deep_discount_push_ratio": 0.4,
     "points_drop_pct": 40,

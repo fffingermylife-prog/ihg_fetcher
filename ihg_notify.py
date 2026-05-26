@@ -44,7 +44,7 @@ CONFIG_PATH = Path(__file__).parent / "notify_config.json"
 
 DEFAULT_RULES = {
     # ===== file 阈值 (初筛, 入全量文件) =====
-    "min_cpp_threshold": 0.8,             # 💎 CPP ≥ 0.8 (USD 美分/积分, 每万积分价值≥$80)
+    "min_cpp_threshold": 80,              # 💎 CPP ≥ $80/万分 (即每万积分价值 ≥ $80)
     "points_drop_pct": 40,                # 🔴 同日积分降幅 ≥ 40%
     "holiday_points_ratio": 0.9,          # 🟠 节假日积分 ≤ 平日均价×0.9
     "cash_deal_ratio": 0.5,               # 🟣 现金USD ≤ 平日均价×0.5
@@ -52,7 +52,7 @@ DEFAULT_RULES = {
     "points_deep_discount_ratio": 0.5,    # 🟢 积分 ≤ 平日均价×0.5 (任意日期, 平日 bug 价利器)
 
     # ===== push 阈值 (二次过滤, 只推真极端) =====
-    "min_cpp_push": 1.0,                  # 💎 推送阈值: CPP ≥ 1.0 (每万积分 ≥ $100)
+    "min_cpp_push": 100,                  # 💎 推送阈值: CPP ≥ $100/万分 (每万积分 ≥ $100)
     "points_drop_push_pct": 50,           # 🔴 推送: 同日降幅 ≥ 50%
     "holiday_points_push_ratio": 0.7,     # 🟠 推送: 节假日 ≤ 平日均价×0.7 (比平日还便宜 30%)
     "cash_deal_push_ratio": 0.4,          # 🟣 推送: 现金 ≤ 平日均价×0.4 (60%折扣以下)
@@ -219,7 +219,7 @@ def compute_weight(alert):
     score = alert.get("score", 0)
 
     if level == "💎":
-        threshold = alert.get("threshold", 0.8)
+        threshold = alert.get("threshold", 80)
         if threshold > 0:
             weight = min(100, (score / threshold - 1) * 50 + 70)
         else:
@@ -253,7 +253,7 @@ def passes_push_threshold(alert, rules):
     score = alert.get("score", 0)
 
     if level == "💎":
-        return score >= rules.get("min_cpp_push", 1.0)
+        return score >= rules.get("min_cpp_push", 100)
     elif level == "🟢":
         # score = below_avg_pct, push_ratio=0.4 → 阈值是 60%
         push_ratio = rules.get("points_deep_discount_push_ratio", 0.4)
@@ -300,7 +300,7 @@ def filter_alerts(results, db, config):
 
         # ===== 基于本次快照扫描 =====
         hotel_snapshot_alerts = []
-        min_cpp = rules.get("min_cpp_threshold", 0.8)
+        min_cpp = rules.get("min_cpp_threshold", 80)
         deep_ratio = rules.get("points_deep_discount_ratio", 0.5)
         holiday_ratio = rules.get("holiday_points_ratio", 0.9)
         deal_ratio = rules.get("cash_deal_ratio", 0.5)
@@ -312,7 +312,7 @@ def filter_alerts(results, db, config):
 
             cash_usd = p.get("cash_price_usd")
             points = p.get("points")
-            cpp = p.get("cpp")  # USD 美分/积分
+            cpp = p.get("cpp")  # USD/万分
 
             # 💎 高 CPP 积分房 (双重 bug 价过滤)
             if cpp and cpp >= min_cpp and points:
@@ -323,7 +323,7 @@ def filter_alerts(results, db, config):
                         "level": "💎", "rank": 0,
                         "type": "高CPP积分房",
                         "hotel": hotel_code, "label": label, "date": d,
-                        "detail": f"{points}分 ≈${cash_usd:.0f} CPP={cpp:.2f}¢",
+                        "detail": f"{points}分 ≈${cash_usd:.0f} CPP=${cpp:.0f}/万分",
                         "score": cpp,
                         "threshold": min_cpp,
                     })
