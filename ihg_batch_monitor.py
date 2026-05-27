@@ -57,6 +57,7 @@ REQUEST_DELAY_MS = (100, 300)  # 随机延迟区间 (毫秒, 整合档 A2: 200~5
 MAX_RETRIES = 1                # 单酒店内部失败重试次数 (本批次内立即重试)
 HOTEL_FETCH_TIMEOUT = 120      # 单酒店 fetch_hotel_prices 整体超时秒数
 MAX_BATCH_ATTEMPTS = 3         # 跨批次最大尝试次数 (失败酒店换节点重试)
+SAME_PAGE_INFLIGHT = 2         # 同 page 最多多少个 fetch 同时在飞 (2=配对并发=Step 3, 3=流水线模式)
 
 # 这些参数由 main() 局部使用, 但默认值放这里集中管理
 DEFAULT_CONCURRENCY = 3              # 默认并发 Tab 数
@@ -88,7 +89,7 @@ def load_runtime_config():
         dict: {"concurrency": int}  仅返回 main() 需要的默认值, 其余参数通过 global 改本模块常量
     """
     global WINDOW_SIZE_DAYS, REQUEST_DELAY_MS, MAX_RETRIES
-    global HOTEL_FETCH_TIMEOUT, MAX_BATCH_ATTEMPTS
+    global HOTEL_FETCH_TIMEOUT, MAX_BATCH_ATTEMPTS, SAME_PAGE_INFLIGHT
 
     runtime_out = {"concurrency": DEFAULT_CONCURRENCY}
 
@@ -115,6 +116,8 @@ def load_runtime_config():
             HOTEL_FETCH_TIMEOUT = int(rt["hotel_fetch_timeout_sec"])
         if "max_batch_attempts" in rt:
             MAX_BATCH_ATTEMPTS = int(rt["max_batch_attempts"])
+        if "same_page_inflight" in rt:
+            SAME_PAGE_INFLIGHT = max(2, min(6, int(rt["same_page_inflight"])))
         if "concurrency" in rt:
             runtime_out["concurrency"] = int(rt["concurrency"])
     except Exception as e:
@@ -420,18 +423,13 @@ def parse_points(response_data):
 
 # ============ 单酒店获取逻辑 ============
 
-async def fetch_hotel_prices(page, hotel_code, windows):
-    """获取单个酒店的全部价格 (现金+积分), 返回合并后的列表
-
-    Step 3 优化: 同窗口的现金和积分请求并发发送 (asyncio.gather → 同 page 内 2 路 fetch 同时执行)
-    - 项目历史: 同 page 6 路并发会被 Akamai 限流, 但 2 路并发安全 (有头浏览器 + 完整 session)
-    - 单酒店耗时: 旧版 12 次串行 ~8s → 新版 6 次配对并发 ~4s, 节省 ~50%
-    - wait_for_timeout 也从 12 次降到 6 次 (每对配对之间一次)
+async def _fetch_paired(page, hotel_code, windows):
+    """2 路同 page 配对并发 (Step 3 行为, 默认):
+    每窗口同时发 cash + points (asyncio.gather), 配对之间串行 wait.
+    单酒店耗时: 12 次串行 → 6 次配对并发 ~50%.
     """
     all_cash = []
     all_points = []
-
-    # 现金 + 积分配对并发: 每个窗口同时发 2 个请求, 等两者都返回再进入下一窗口
     for ws, we in windows:
         cash_resp, points_resp = await asyncio.gather(
             fetch_calendar(page, hotel_code, ws, we, points_mode=False),
@@ -440,6 +438,54 @@ async def fetch_hotel_prices(page, hotel_code, windows):
         all_cash.extend(parse_cash(cash_resp))
         all_points.extend(parse_points(points_resp))
         await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
+    return all_cash, all_points
+
+
+async def _fetch_pipelined(page, hotel_code, windows, max_inflight):
+    """N 路同 page 流水线 (实验性, max_inflight >= 3):
+    用 Semaphore 限制同 page 在飞 fetch 数, 不再窗口边界等待.
+    所有 cash + points 任务一起 schedule, 由 sem 控制最大并发.
+    单酒店耗时: 6 次配对 (~6×T) → 4 次配对 (~4×T) (max_inflight=3 时), 节省 ~33%.
+
+    项目历史: 同 page 6 路并发会被 Akamai 限流, 2 路稳定.
+    3~4 路是未实测区间, 谨慎从 3 路起步, 若稳定再上 4.
+    """
+    sem = asyncio.Semaphore(max_inflight)
+
+    async def _do(ws, we, points_mode):
+        async with sem:
+            resp = await fetch_calendar(page, hotel_code, ws, we, points_mode)
+            # 延迟在 sem 释放前: 避免空出 slot 后立刻又有新请求挤进来
+            await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
+            return resp
+
+    # 所有窗口的 cash + points 任务一起调度, sem 控制并发
+    tasks = []
+    for ws, we in windows:
+        tasks.append(_do(ws, we, False))   # cash
+        tasks.append(_do(ws, we, True))    # points
+    responses = await asyncio.gather(*tasks)
+
+    # responses 顺序: [w0_cash, w0_points, w1_cash, w1_points, ...]
+    all_cash = []
+    all_points = []
+    for i in range(0, len(responses), 2):
+        all_cash.extend(parse_cash(responses[i]))
+        all_points.extend(parse_points(responses[i + 1]))
+    return all_cash, all_points
+
+
+async def fetch_hotel_prices(page, hotel_code, windows):
+    """获取单个酒店的全部价格 (现金+积分), 返回合并后的列表
+
+    根据 SAME_PAGE_INFLIGHT 选择并发模式:
+    - 2 (默认, 安全): 配对并发, 现金/积分同窗口同时发, 不同窗口串行
+    - 3+ (实验性):    流水线, 同 page 最多 N 个 fetch 在飞, 不再窗口边界等待
+    """
+    if SAME_PAGE_INFLIGHT >= 3:
+        all_cash, all_points = await _fetch_pipelined(page, hotel_code, windows, SAME_PAGE_INFLIGHT)
+    else:
+        all_cash, all_points = await _fetch_paired(page, hotel_code, windows)
 
     # 合并
     cash_map = {c["date"]: c for c in all_cash}
@@ -1072,7 +1118,8 @@ def format_change_detail(item):
 
 async def main():
     # 整合档 A3+B1: 启动时读取 notify_config.json 的 runtime 段, 覆盖 module 常量
-    # (WINDOW_SIZE_DAYS / REQUEST_DELAY_MS / MAX_RETRIES / HOTEL_FETCH_TIMEOUT / MAX_BATCH_ATTEMPTS)
+    # (WINDOW_SIZE_DAYS / REQUEST_DELAY_MS / MAX_RETRIES / HOTEL_FETCH_TIMEOUT / MAX_BATCH_ATTEMPTS / SAME_PAGE_INFLIGHT)
+    global SAME_PAGE_INFLIGHT  # main() 内可能被 --inflight 覆盖, 需提前声明
     runtime_cfg = load_runtime_config()
 
     parser = argparse.ArgumentParser(description="IHG 多酒店批量价格监控")
@@ -1098,10 +1145,26 @@ async def main():
                         help="代理地址 (如 http://127.0.0.1:7890)")
     parser.add_argument("--auto-switch", action="store_true",
                         help="启用 Clash 自动切换节点 (需配置 notify_config.json 中 clash 字段)")
+    parser.add_argument("--warmup", action="store_true",
+                        help="启动前测试所有 Clash 节点速度, 剔除慢节点 (推荐 --auto-switch 时使用)")
+    parser.add_argument("--warmup-threshold", type=int, default=2500,
+                        help="预热: 超过此 ms 的节点剔除 (默认 2500)")
+    parser.add_argument("--warmup-top", type=int, default=None,
+                        help="预热: 只保留前 N 个最快节点 (默认全保留排序后)")
+    parser.add_argument("--warmup-sample", type=int, default=None,
+                        help="预热: 随机采样 N 个节点测试 (节点池大时省时间, 默认全测)")
+    parser.add_argument("--warmup-url", type=str, default=None,
+                        help="预热测试 URL (默认 Cloudflare 204; 想测 IHG 实际路径可改)")
+    parser.add_argument("--inflight", type=int, default=None,
+                        help=f"同 page 最多并发 fetch 数 (2=配对, 3+=流水线; 默认 {SAME_PAGE_INFLIGHT}, 来自 notify_config.json runtime.same_page_inflight)")
     args = parser.parse_args()
 
     # 限制并发数
     concurrency = min(max(args.concurrency, 1), 3)
+
+    # 命令行 --inflight 覆盖配置的 SAME_PAGE_INFLIGHT
+    if args.inflight is not None:
+        SAME_PAGE_INFLIGHT = max(2, min(6, args.inflight))
 
     # 加载酒店列表
     hotel_codes = load_hotel_codes(args)
@@ -1132,6 +1195,25 @@ async def main():
             args.proxy = "http://127.0.0.1:7890"
             print(f"[Clash] 自动设置代理: {args.proxy}")
 
+        # ============ 节点速度预热 ============
+        # 必须在 args.proxy 设置之后, 在第一次 launch context 之前
+        if clash_mgr and args.warmup:
+            print()  # 空行分隔
+            try:
+                clash_mgr.warmup_nodes(
+                    proxy_url=args.proxy or "http://127.0.0.1:7890",
+                    test_url=args.warmup_url,
+                    timeout=5,
+                    max_threshold_ms=args.warmup_threshold,
+                    top_n=args.warmup_top,
+                    sample=args.warmup_sample,
+                )
+                if not clash_mgr.available_nodes:
+                    print("[Clash] [致命] 预热后无可用节点, 退出")
+                    return
+            except Exception as e:
+                print(f"[Clash] 预热失败 (继续用原节点池): {e}")
+
     # 确定日期窗口
     start = date.today() + timedelta(days=1)
     if args.incremental:
@@ -1157,16 +1239,22 @@ async def main():
     print(f"  模式: {mode_str} | 并发: {concurrency} Tab | 酒店: {len(hotel_codes)} 个")
     print(f"  日期: {windows[0][0]} ~ {windows[-1][1]} ({len(windows)} 个窗口)")
     print(f"  每酒店请求: 现金 {len(windows)} 次 + 积分 {len(windows)} 次")
+    inflight_mode = ("流水线" if SAME_PAGE_INFLIGHT >= 3 else "配对并发")
+    print(f"  同 page 并发: {SAME_PAGE_INFLIGHT} 路 ({inflight_mode})")
     print(f"  运行时: 延迟 {REQUEST_DELAY_MS[0]}~{REQUEST_DELAY_MS[1]}ms | 单酒店超时 {HOTEL_FETCH_TIMEOUT}s | 内部重试 {MAX_RETRIES} | 跨批重试上限 {MAX_BATCH_ATTEMPTS}")
     if clash_mgr:
         print(f"  批次模式: 每批 {batch_size} 个酒店 → 关 context + 切节点 + 重建 (估 {est_batches} 批)")
     else:
         print(f"  单批模式: 直连无切换")
-    # 预估耗时 (Step 3 优化后):
-    # - 单酒店现金+积分配对并发, 每对耗时 ~ max(cash, points) ≈ 单次请求时间
-    # - 总等待数从 len(windows)*2 降到 len(windows) (每对配对之间一次)
-    # - 因此 est_fetch 公式相比旧版砍半 (旧公式: len(windows)*2 * delay_avg)
-    est_fetch = len(hotel_codes) * len(windows) * (sum(REQUEST_DELAY_MS) / 2 / 1000) / concurrency
+    # 预估耗时 (Step 3 + 流水线优化后):
+    # - 配对模式 (inflight=2): len(windows) 个配对周期 × 平均延迟
+    # - 流水线 (inflight=3+): len(windows)*2 / inflight 个并发周期 × 平均延迟
+    delay_avg = sum(REQUEST_DELAY_MS) / 2 / 1000
+    if SAME_PAGE_INFLIGHT >= 3:
+        per_hotel_units = (len(windows) * 2) / SAME_PAGE_INFLIGHT
+    else:
+        per_hotel_units = len(windows)  # 配对并发, 单位 = 窗口数
+    est_fetch = len(hotel_codes) * per_hotel_units * delay_avg / concurrency
     est_overhead = est_batches * 8 if clash_mgr else 0
     est_time = est_fetch + est_overhead
     print(f"  预估耗时: ~{est_time:.0f}s ({est_time/60:.1f}min)")
