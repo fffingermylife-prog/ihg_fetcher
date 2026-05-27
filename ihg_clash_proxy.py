@@ -330,31 +330,39 @@ class ClashProxyManager:
                      max_threshold_ms=2500,
                      top_n=None,
                      sample=None,
-                     min_keep=3):
-        """节点速度预热: 逐个切换节点测速, 剔除慢节点, 按速度排序
+                     min_keep=3,
+                     concurrency=20):
+        """节点速度预热 (并发版): 通过 Clash 内置 /proxies/{name}/delay API 测每个节点延迟
 
-        效果: 跑 batch_monitor 前先剔除慢节点, 避免日本08/越南某些节点拖累整批
+        效果: 跑 batch_monitor 前先剔除慢节点, 节点池只保留快节点供后续轮换使用
               (实测同一池里节点速度差 3~10 倍, 选快节点能让单酒店耗时再砍 30~50%)
 
+        实现: 用 Clash 标准 API `/proxies/{name}/delay`, 不需要切换节点直接探测.
+              这是 yacd / Clash dashboard 等仪表盘用的同款接口, 可大并发调用.
+              旧串行版每节点 ~3s (切换+ping); 并发版 30 节点 ~5s 出结果, 快 ~15 倍.
+
+        典型调用 (用户场景: 保留延迟<400ms 的最快 15 个):
+            mgr.warmup_nodes(max_threshold_ms=400, top_n=15)
+
         Args:
-            proxy_url: 本地 Clash 代理入口 (浏览器实际走的)
-            test_url: 测试目标; None=默认 Cloudflare 204 (稳定不会被拦)
-                     对 IHG 调优可设 'https://apis.ihg.com/finance/conversions/v2/currencies?qFcc=USD&qTcc=HKD&qV=1'
-            timeout: 单节点测试超时秒数
-            max_threshold_ms: 响应时间超过此值的节点剔除 (>2500ms 已经太慢, 建议设到 1500~2500)
-            top_n: 只保留前 N 个最快节点 (None=全保留排序后)
-            sample: 随机采样测试 N 个节点 (节点池超大时省时间, None=全测)
-            min_keep: 最少保留节点数 (即使全部超阈值, 也保留前 min_keep 个最快的, 避免节点池被清空)
+            proxy_url: [已废弃, 仅保留兼容] 旧版需要本地代理走流量, 新版直接调 Clash API
+            test_url: Clash 内部探测目标 URL; None=Cloudflare 204 (稳定不被拦)
+                     对 IHG 调优可设 'http://apis.ihg.com/...' (但 Akamai 可能影响结果)
+            timeout: Clash 单节点测试超时秒数 (Clash 把这个值传给内部探测)
+            max_threshold_ms: 延迟超此值的节点剔除 (用户场景 400, 默认 2500 宽松)
+            top_n: 只保留前 N 个最快节点 (用户场景 15, None=全保留按速度排序)
+            sample: 随机采样测试 N 个节点 (节点池>50 时省时间, None=全测)
+            min_keep: 最少保留节点数 (即使全部超阈值, 也保留前 min_keep 个最快的)
+            concurrency: 并发测试线程数 (默认 20, 节点池<20 时自动降到节点数)
 
         Returns:
-            list of (node_name, latency_ms) 按速度升序; 同时 self.available_nodes 已被替换为快节点列表
+            list of (node, delay_ms, status) 按速度升序; self.available_nodes 已被替换
         """
         if not self.available_nodes:
             print("[Clash] 没有可用节点, 跳过预热")
             return []
 
-        # 默认测速目标: Cloudflare 204 (全球边缘, 稳定不拦)
-        # 想测 IHG 实际路径可传 test_url='https://apis.ihg.com/...'
+        # 默认测速目标: Cloudflare 204 (Clash 内部走节点探测, 稳定不被拦)
         if test_url is None:
             test_url = "http://cp.cloudflare.com/generate_204"
 
@@ -362,92 +370,107 @@ class ClashProxyManager:
         if sample and len(candidates) > sample:
             candidates = random.sample(candidates, sample)
 
-        print(f"[Clash] 节点速度预热开始")
-        print(f"        测试节点: {len(candidates)} 个 | 目标: {test_url}")
-        print(f"        阈值: <={max_threshold_ms}ms | 超时: {timeout}s")
+        # 并发数不超过候选节点数
+        actual_concurrency = min(concurrency, len(candidates))
+
+        print(f"[Clash] 节点速度预热 (并发 Clash API 探测)")
+        print(f"        测试节点: {len(candidates)} 个 | 并发: {actual_concurrency} | 目标: {test_url}")
+        print(f"        阈值: <={max_threshold_ms}ms | 超时: {timeout}s | top_n: {top_n or '全保留'}")
 
         original_node = self.current_node
-        results = []  # list of (node, latency_ms, status)
-        proxies = {"http": proxy_url, "https": proxy_url}
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0",
-            "accept": "*/*",
-        }
 
-        t_start = time.time()
-        for i, node in enumerate(candidates, 1):
-            # 切换到该节点
-            ok = self._switch_to(node)
-            if not ok:
-                print(f"  [{i:>2}/{len(candidates)}] {node:<40} 切换失败")
-                continue
-            # 切换后短暂等 Clash 路由表更新
-            time.sleep(0.3)
-
-            # 测速
+        def _test_one_node(node):
+            """通过 Clash /proxies/{name}/delay API 测单节点延迟 (无需切换)
+            Returns: (node, delay_ms_or_None, status_str)
+            """
             try:
-                t0 = time.time()
+                url = f"{self.api_url}/proxies/{quote(node, safe='')}/delay"
+                params = {"timeout": int(timeout * 1000), "url": test_url}
                 resp = requests.get(
-                    test_url, proxies=proxies, headers=headers,
-                    timeout=timeout, allow_redirects=False,
+                    url,
+                    headers=self._headers(),
+                    params=params,
+                    timeout=timeout + 2,  # HTTP 调用比 Clash 内部超时多 2s 余量
                 )
-                elapsed_ms = (time.time() - t0) * 1000
-                # 200/204/3xx/4xx 都视作可达 (TLS+RTT 测完了); 5xx 视作源站问题, 节点本身可能 OK
-                if resp.status_code < 600:
-                    if elapsed_ms <= max_threshold_ms:
-                        marker = "✓"
-                    else:
-                        marker = "⚠ 慢"
-                    results.append((node, elapsed_ms, resp.status_code, marker))
-                    print(f"  [{i:>2}/{len(candidates)}] {node:<40} {elapsed_ms:>6.0f} ms (HTTP {resp.status_code}) {marker}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    delay = data.get("delay", 0)
+                    if delay and delay > 0:
+                        return (node, int(delay), "ok")
+                    # delay=0 通常意味着 Clash 探测失败但没明确报错
+                    return (node, None, "no_delay")
+                elif resp.status_code == 408:
+                    return (node, None, "timeout")
                 else:
-                    print(f"  [{i:>2}/{len(candidates)}] {node:<40} 异常状态 {resp.status_code}")
+                    # 部分 Clash 版本对探测失败返回非 200 (如 500 + message)
+                    try:
+                        err = resp.json().get("message", "")[:30]
+                    except Exception:
+                        err = ""
+                    return (node, None, f"http_{resp.status_code}({err})" if err else f"http_{resp.status_code}")
             except requests.exceptions.Timeout:
-                print(f"  [{i:>2}/{len(candidates)}] {node:<40} 超时 (>{timeout}s) ✗")
-            except requests.exceptions.ProxyError as e:
-                print(f"  [{i:>2}/{len(candidates)}] {node:<40} 代理错误: {str(e)[:40]}")
+                return (node, None, "http_timeout")
             except Exception as e:
-                print(f"  [{i:>2}/{len(candidates)}] {node:<40} 失败: {str(e)[:40]}")
+                return (node, None, f"err: {str(e)[:30]}")
+
+        # 并发测试: 用 ThreadPoolExecutor (requests 是同步的, 用线程池更省事)
+        import concurrent.futures
+        t_start = time.time()
+        all_results = []   # [(node, delay_ms_or_None, status), ...]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=actual_concurrency) as executor:
+            futures = {executor.submit(_test_one_node, n): n for n in candidates}
+            # as_completed: 返回顺序 = 完成顺序 → 快节点先打印
+            for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                node, delay, status = future.result()
+                all_results.append((node, delay, status))
+                if status == "ok":
+                    marker = "✓" if delay <= max_threshold_ms else "⚠ 慢"
+                    print(f"  [{i:>2}/{len(candidates)}] {node:<40} {delay:>5}ms {marker}")
+                else:
+                    print(f"  [{i:>2}/{len(candidates)}] {node:<40}    -   ✗ {status}")
 
         warmup_elapsed = time.time() - t_start
 
-        # 排序: 按延迟升序
-        results.sort(key=lambda x: x[1])
+        # 排序: 仅成功的, 按延迟升序
+        ok_nodes = [(n, d) for n, d, s in all_results if d is not None]
+        ok_nodes.sort(key=lambda x: x[1])
 
-        # 按阈值筛选
-        good = [r for r in results if r[1] <= max_threshold_ms]
-        slow = [r for r in results if r[1] > max_threshold_ms]
+        # 阈值筛选
+        good = [(n, d) for n, d in ok_nodes if d <= max_threshold_ms]
+        slow = [(n, d) for n, d in ok_nodes if d > max_threshold_ms]
+        failed = [n for n, d, s in all_results if d is None]
 
-        # 兜底: 如果阈值太严导致没节点了, 至少保留 min_keep 个最快的
-        if len(good) < min_keep and len(results) >= min_keep:
-            good = results[:min_keep]
-            print(f"[Clash] [警告] 阈值 {max_threshold_ms}ms 太严, 只放行 {len(good)} 个最快节点 (min_keep)")
+        # 兜底: 至少保留 min_keep 个最快
+        if len(good) < min_keep and len(ok_nodes) >= min_keep:
+            good = ok_nodes[:min_keep]
+            print(f"[Clash] [警告] 阈值 {max_threshold_ms}ms 太严, 放行前 {len(good)} 个最快 (min_keep={min_keep})")
 
-        # 截取 top_n
+        # 截 top_n
         if top_n is not None and len(good) > top_n:
             good = good[:top_n]
 
-        fast_nodes = [r[0] for r in good]
+        fast_nodes = [n for n, d in good]
 
         print(f"[Clash] 预热完成 (耗时 {warmup_elapsed:.1f}s)")
-        print(f"        总测试: {len(results)} 个 | 保留: {len(fast_nodes)} 个 | 剔除慢节点: {len(slow)} 个")
+        print(f"        测试: {len(candidates)} | 成功: {len(ok_nodes)} | 失败: {len(failed)}")
+        print(f"        合格 (≤{max_threshold_ms}ms): {len([d for n, d in ok_nodes if d <= max_threshold_ms])} | "
+              f"剔除: {len(slow)}慢 + {len(failed)}失败")
+        print(f"        节点池保留: {len(fast_nodes)} 个 (后续批次仅在这些节点轮换)")
         if good:
-            print(f"        最快: {good[0][0]} ({good[0][1]:.0f}ms)")
-            print(f"        最慢保留: {good[-1][0]} ({good[-1][1]:.0f}ms)")
+            print(f"        最快: {good[0][0]} ({good[0][1]}ms)")
+            print(f"        最慢保留: {good[-1][0]} ({good[-1][1]}ms)")
 
-        # 替换可用节点池为快节点
+        # 替换 available_nodes 为快节点; 切到最快节点开跑
         if fast_nodes:
             self.available_nodes = fast_nodes
-            # 切到最快节点开始
             self._switch_to(fast_nodes[0])
         else:
             print(f"[Clash] [警告] 预热后无可用节点, 恢复原节点 {original_node}")
             if original_node:
                 self._switch_to(original_node)
 
-        # 返回完整结果 (调用方可用于打印/分析)
-        return [(n, lat, status, mk) for n, lat, status, mk in results]
+        return all_results
 
     def test_proxy_connectivity(self, proxy_url="http://127.0.0.1:7890", test_url=None, timeout=10):
         """
@@ -506,17 +529,19 @@ def main():
     parser.add_argument("--switch", type=str, default=None, help="切换到指定节点")
     parser.add_argument("--rotate", action="store_true", help="随机切换一次")
     parser.add_argument("--warmup", action="store_true",
-                        help="节点速度预热: 逐个测试节点速度, 剔除慢节点")
+                        help="节点速度预热: 并发测所有节点延迟, 剔除慢节点")
     parser.add_argument("--warmup-url", type=str, default=None,
                         help="预热测试 URL (默认 Cloudflare 204; 可设 IHG API 测实际路径)")
-    parser.add_argument("--warmup-threshold", type=int, default=2500,
-                        help="预热: 超过此 ms 的节点剔除 (默认 2500)")
-    parser.add_argument("--warmup-top", type=int, default=None,
-                        help="预热: 只保留前 N 个最快节点")
+    parser.add_argument("--warmup-threshold", type=int, default=400,
+                        help="预热: 超过此 ms 的节点剔除 (默认 400)")
+    parser.add_argument("--warmup-top", type=int, default=15,
+                        help="预热: 只保留前 N 个最快节点 (默认 15)")
     parser.add_argument("--warmup-sample", type=int, default=None,
                         help="预热: 随机采样 N 个节点测试 (节点池大时省时间)")
     parser.add_argument("--warmup-timeout", type=int, default=5,
                         help="预热: 单节点测试超时秒数 (默认 5)")
+    parser.add_argument("--warmup-concurrency", type=int, default=20,
+                        help="预热: 并发测试线程数 (默认 20)")
     parser.add_argument("--proxy", type=str, default="http://127.0.0.1:7890",
                         help="本地 Clash 代理地址 (默认 http://127.0.0.1:7890)")
     args = parser.parse_args()
@@ -569,6 +594,7 @@ def main():
             max_threshold_ms=args.warmup_threshold,
             top_n=args.warmup_top,
             sample=args.warmup_sample,
+            concurrency=args.warmup_concurrency,
         )
         if not results:
             print("[Clash] 预热未得到任何结果")

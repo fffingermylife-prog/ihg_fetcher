@@ -1146,15 +1146,17 @@ async def main():
     parser.add_argument("--auto-switch", action="store_true",
                         help="启用 Clash 自动切换节点 (需配置 notify_config.json 中 clash 字段)")
     parser.add_argument("--warmup", action="store_true",
-                        help="启动前测试所有 Clash 节点速度, 剔除慢节点 (推荐 --auto-switch 时使用)")
-    parser.add_argument("--warmup-threshold", type=int, default=2500,
-                        help="预热: 超过此 ms 的节点剔除 (默认 2500)")
-    parser.add_argument("--warmup-top", type=int, default=None,
-                        help="预热: 只保留前 N 个最快节点 (默认全保留排序后)")
+                        help="启动前并发探测所有 Clash 节点延迟, 剔除慢节点 (推荐 --auto-switch 时使用)")
+    parser.add_argument("--warmup-threshold", type=int, default=400,
+                        help="预热: 超过此 ms 的节点剔除 (默认 400; 串行版历史默认 2500, 并发版可严)")
+    parser.add_argument("--warmup-top", type=int, default=15,
+                        help="预热: 只保留前 N 个最快节点 (默认 15; 后续批次仅在这些节点轮换)")
     parser.add_argument("--warmup-sample", type=int, default=None,
-                        help="预热: 随机采样 N 个节点测试 (节点池大时省时间, 默认全测)")
+                        help="预热: 随机采样 N 个节点测试 (节点池>50 时省时间, 默认全测)")
     parser.add_argument("--warmup-url", type=str, default=None,
                         help="预热测试 URL (默认 Cloudflare 204; 想测 IHG 实际路径可改)")
+    parser.add_argument("--warmup-concurrency", type=int, default=20,
+                        help="预热: 并发测试线程数 (默认 20)")
     parser.add_argument("--inflight", type=int, default=None,
                         help=f"同 page 最多并发 fetch 数 (2=配对, 3+=流水线; 默认 {SAME_PAGE_INFLIGHT}, 来自 notify_config.json runtime.same_page_inflight)")
     args = parser.parse_args()
@@ -1207,6 +1209,7 @@ async def main():
                     max_threshold_ms=args.warmup_threshold,
                     top_n=args.warmup_top,
                     sample=args.warmup_sample,
+                    concurrency=args.warmup_concurrency,
                 )
                 if not clash_mgr.available_nodes:
                     print("[Clash] [致命] 预热后无可用节点, 退出")
