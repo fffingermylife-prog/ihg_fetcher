@@ -35,6 +35,7 @@
 - 自动触发微信通知 (满足告警条件时)
 - **Step 2 失败延迟集中重试** (✨ 新增): 单酒店失败不再中止整批, 失败酒店放入 requeue 进入下批次 (新节点) 重试; main 中 MAX_BATCH_ATTEMPTS=3 防无限循环
 - **Step 3 同酒店现金/积分配对并发** (✨ 新增): `fetch_hotel_prices` 内 `asyncio.gather` 同窗口同时发现金+积分 2 个 fetch, 单酒店耗时从 ~8s 降到 ~4s (节省 ~50%)
+- **整合档 A1+A2+A3+B1** (✨ 新增): 所有运行时参数 (WINDOW_SIZE_DAYS / REQUEST_DELAY_MS / MAX_RETRIES / HOTEL_FETCH_TIMEOUT / MAX_BATCH_ATTEMPTS / 默认 concurrency) 全部抽到 `notify_config.json` 的 `runtime` 段, `load_runtime_config()` 启动时读取覆盖 module 常量; **rotate_every_n 8 → 16** (减半批次重建开销); **REQUEST_DELAY_MS 200~500 → 100~300** (单酒店再砍 ~1s)
 
 ### 3. SQLite 数据库 (`ihg_db.py`)
 - `hotels` 表: 酒店基本信息 (从 hotel_list_fetcher 写入)
@@ -146,6 +147,38 @@ if cpp >= min_cpp and points and points_ok and cash_ok:
   - `filter_alerts` 中 4 条积分规则 alert dict 加 `"points": <值>` 字段
   - `passes_push_threshold` 开头检查 `alert["level"] in {💎🟢🟠🔴} and points > max_points → return False`
 - 设计意图: 高积分酒店 (如 70000 分/晚 IC 顶级) 性价比再高也对小积分玩家不可达, 不必打扰推送; 但仍写文件保留, 积分储备充足时可参考
+
+#### 4.10 ALERT_RULES 元数据表 (✨ 整合档 B2)
+
+**问题**: 6 条规则元信息 (level/rank/type/file_key/push_key/kind) 散落在 `passes_push_threshold` 的 if/elif 分支 + `filter_alerts` 的 alert dict 字面量中, 加新规则要改 4~5 处。
+
+**整合**: 抽出 `ALERT_RULES` 字典作为单一来源:
+
+```python
+ALERT_RULES = {
+    "💎": {
+        "rank": 0, "type": "高CPP积分房", "kind": "points",
+        "file_key": "min_cpp_threshold", "file_default": 0.8,
+        "push_key": "min_cpp_push", "push_default": 1.0,
+        "score_kind": "absolute",       # score >= push_value
+    },
+    "🟢": {..., "score_kind": "below_avg_pct"},  # score >= (1-push_ratio)*100
+    "🔴": {..., "score_kind": "absolute"},
+    "🟠": {..., "score_kind": "below_avg_pct"},
+    "🟣": {..., "score_kind": "below_avg_pct"},
+    "🟡": {..., "score_kind": "absolute"},
+}
+
+POINTS_LEVELS = {lvl for lvl, m in ALERT_RULES.items() if m["kind"] == "points"}
+DEFAULT_RULES = _build_default_rules()  # 自动从表生成 file/push 默认值
+```
+
+**重构后**:
+- `passes_push_threshold`: 由 if/elif/elif 6 分支 → 4 行查表逻辑 (按 `score_kind` 二分支)
+- `filter_alerts`: 6 处 alert dict 字面量 → 6 处 `_make_alert(level, ..., **extra)` (level/rank/type 自动从表读)
+- `DEFAULT_RULES` 自动派生, 不再手写 12 个键值对
+
+**加新规则只需在 ALERT_RULES 加一行 + 在 `filter_alerts` 加触发分支** (元数据 + 触发逻辑分离, 不再散落)
 
 ### 5. Clash 代理自动切换 (`ihg_clash_proxy.py`)
 - 通过 Clash RESTful API 自动切换节点
@@ -300,6 +333,8 @@ if cpp >= min_cpp and points and points_ok and cash_ok:
 | 高积分酒店 (70000 分/晚) 推送对小积分玩家不可达 | CPP 高但门槛过高, 全量过滤又会丢失数据 | `max_points_per_night=35000` **仅 push 阶段过滤**, file 全量保留供回查 |
 | 单酒店失败立刻 abort 整批 → 浪费 7 个酒店进度 + 1 次 context 重建 | 旧设计: 任一失败立刻 set abort_event | **Step 2 失败延迟集中重试**: worker 仅 requeue, 失败酒店进入下批新节点重试 |
 | 单酒店现金 6 + 积分 6 = 12 次串行, 单酒店 ~8s | 早期保守串行避开 Akamai 限流 | **Step 3 同酒店现金/积分配对并发**: `asyncio.gather` 同 page 2 路 fetch, 单酒店 ~4s |
+| 运行时参数 (WINDOW/DELAY/RETRY/TIMEOUT 等) 散落在 .py 顶部, 调参要改代码 | 早期硬编码模块常量 | **整合档 A3+B1**: 抽到 `notify_config.json` 的 `runtime` 段, `load_runtime_config()` 启动时覆盖 module 常量; 命令行 `--concurrency` 仍可覆盖 |
+| 6 条规则元信息 (level/rank/type/file_key/push_key) 散落在 if/elif 分支 + alert dict 字面量, 加新规则要改 4~5 处 | 早期 6 条规则规模小, 字面量直观 | **整合档 B2**: 抽出 `ALERT_RULES` 元数据表, `passes_push_threshold` 改查表, `_make_alert` 自动填 rank/type; 加新规则只需改表 + 加一个触发分支 |
 
 ---
 
@@ -327,6 +362,14 @@ fffingermylife-prog/ihg_fetcher (分支: feat/ihg-calendar-price)
 ```json
 {
   "server_chan_key": "SCT...",
+  "runtime": {
+    "window_size_days": 62,
+    "request_delay_ms_min": 100,           "request_delay_ms_max": 300,
+    "max_retries": 1,
+    "max_batch_attempts": 3,
+    "hotel_fetch_timeout_sec": 120,
+    "concurrency": 3
+  },
   "rules": {
     "min_cpp_threshold": 0.8,            "min_cpp_push": 1.0,
     "points_deep_discount_ratio": 0.5,   "points_deep_discount_push_ratio": 0.4,
@@ -345,12 +388,17 @@ fffingermylife-prog/ihg_fetcher (分支: feat/ihg-calendar-price)
     "api_url": "http://127.0.0.1:64821",
     "secret": "secret",
     "proxy_group": "GLOBAL",
-    "rotate_every_n": 8,
+    "rotate_every_n": 16,
     "only_flag_emoji": true,
     "exclude_keywords": ["Traffic","Expire","DIRECT","REJECT","GLOBAL","Proxies","Final"]
   }
 }
 ```
+
+**整合档说明**:
+- `runtime` 段是整合档新增, 抽出原 `ihg_batch_monitor.py` 顶部的 module 常量 (WINDOW_SIZE_DAYS / REQUEST_DELAY_MS / MAX_RETRIES / HOTEL_FETCH_TIMEOUT / MAX_BATCH_ATTEMPTS / 默认 concurrency), 改参数不再需要碰 .py 代码; 命令行 `--concurrency` 优先级高于 `runtime.concurrency`
+- `rules` 段对应 `ihg_notify.py` 的 `ALERT_RULES` 表自动派生默认值; 用户在 `rules` 中配置的值会覆盖 `ALERT_RULES[lvl].file_default / push_default`
+- `clash.rotate_every_n` 整合档由 8 → 16, 减半批次重建开销
 
 ---
 
@@ -436,4 +484,5 @@ python ihg_detect_open_time.py --code HKGKL
 - **`max_points_per_night=35000`**: 4 条积分规则 (💎🟢🟠🔴) 推送阶段额外过滤; 现金规则 🟣🟡 不受影响; 全量 `alerts_*.md` 不过滤, 高积分酒店仍可回查
 - **失败延迟集中重试 (Step 2)**: 单酒店失败仅 requeue, 不再 abort 整批; 失败酒店随主流程进入下批 (新节点) 重试; MAX_BATCH_ATTEMPTS=3 防无限循环
 - **同酒店现金/积分配对并发 (Step 3)**: `fetch_hotel_prices` 内 `asyncio.gather` 同窗口 2 路 fetch (现金+积分); 单酒店耗时砍半 ~8s → ~4s; 仍受 Akamai 限制 (≤2 路同 page 并发, 项目历史已验证 6 路并发会被限流)
-- **未实施的进一步优化** (用户已明确不做): Tier 分层 / 缩天数 (维持全量 365 天 × 全部酒店); 待验证: Step 1 (rotate_every_n 8→16) 和 Step 4 (请求间隔 100~300ms) 用户可随时手动调参
+- **整合档 (A1+A2+A3+B1+B2)** ✨: 运行时参数全部移至 `notify_config.json` 的 `runtime` 段 (window/delay/retries/timeout/max_batch_attempts/concurrency); `rotate_every_n` 8→16; `REQUEST_DELAY_MS` 200~500→100~300; 6 条规则元信息抽出 `ALERT_RULES` 表驱动. 加新规则/改参数不再碰 .py
+- **未实施的进一步优化** (用户已明确不做): Tier 分层 / 缩天数 (维持全量 365 天 × 全部酒店); 待验证: 整合档实测稳定性 (REQUEST_DELAY_MS 缩短后 Akamai 是否限流, rotate_every_n 16 后单批失败影响面)
