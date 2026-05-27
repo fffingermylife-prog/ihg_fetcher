@@ -335,6 +335,8 @@ DEFAULT_RULES = _build_default_rules()  # 自动从表生成 file/push 默认值
 | 单酒店现金 6 + 积分 6 = 12 次串行, 单酒店 ~8s | 早期保守串行避开 Akamai 限流 | **Step 3 同酒店现金/积分配对并发**: `asyncio.gather` 同 page 2 路 fetch, 单酒店 ~4s |
 | 运行时参数 (WINDOW/DELAY/RETRY/TIMEOUT 等) 散落在 .py 顶部, 调参要改代码 | 早期硬编码模块常量 | **整合档 A3+B1**: 抽到 `notify_config.json` 的 `runtime` 段, `load_runtime_config()` 启动时覆盖 module 常量; 命令行 `--concurrency` 仍可覆盖 |
 | 6 条规则元信息 (level/rank/type/file_key/push_key) 散落在 if/elif 分支 + alert dict 字面量, 加新规则要改 4~5 处 | 早期 6 条规则规模小, 字面量直观 | **整合档 B2**: 抽出 `ALERT_RULES` 元数据表, `passes_push_threshold` 改查表, `_make_alert` 自动填 rank/type; 加新规则只需改表 + 加一个触发分支 |
+| 实测 HKGIN 2026-05-31 触发 🟠 节假日积分低价并标 "端午", 但该日期实际是周日普通日期 | `_build_holidays` 短假期表里 `2026-05-31`/`2027-06-19` 是错位写入 (前者是 2025 年端午, 后者是 2026 年端午) | **正确日期**: 2026 端午=`2026-06-19` (周五), 2027 端午=`2027-06-09` (周三). 农历五月初五公历, 已交叉验证 publicholidays.cn/hk + chinatravel.com + 国务院通知, 代码加注释标注农历依据避免再次复制错位 |
+| Windows cmd 直接粘贴命令后, 跑完一遍**自动又跑了一遍** | 代码里没有任何重启逻辑 (asyncio.run 跑完即退出); cmd 粘贴行为遇到 `\n` 会立刻执行当前累积命令再继续读后面字符 | **剪贴板带换行 + 第二份命令** 是常见原因 (复制时多选一行 / 误粘贴两次 / Windows Terminal 多行警告点了允许). 排查: cmd 里 `doskey /history` 看历史是否同一命令出现两次. 防坑: 复制后先粘到记事本确认只有一行, 或直接手敲 |
 
 ---
 
@@ -485,4 +487,6 @@ python ihg_detect_open_time.py --code HKGKL
 - **失败延迟集中重试 (Step 2)**: 单酒店失败仅 requeue, 不再 abort 整批; 失败酒店随主流程进入下批 (新节点) 重试; MAX_BATCH_ATTEMPTS=3 防无限循环
 - **同酒店现金/积分配对并发 (Step 3)**: `fetch_hotel_prices` 内 `asyncio.gather` 同窗口 2 路 fetch (现金+积分); 单酒店耗时砍半 ~8s → ~4s; 仍受 Akamai 限制 (≤2 路同 page 并发, 项目历史已验证 6 路并发会被限流)
 - **整合档 (A1+A2+A3+B1+B2)** ✨: 运行时参数全部移至 `notify_config.json` 的 `runtime` 段 (window/delay/retries/timeout/max_batch_attempts/concurrency); `rotate_every_n` 8→16; `REQUEST_DELAY_MS` 200~500→100~300; 6 条规则元信息抽出 `ALERT_RULES` 表驱动. 加新规则/改参数不再碰 .py
+- **节假日维护陷阱** ⚠️: 2026~2027 中国节假日已校验. 未来如要补 2028+ 必须农历对照表逐年核对——**端午=农历五月初五、中秋=农历八月十五公历日期每年不同**. 历史踩坑: 2026-05-31 ❌ 实际是 2025 端午, 2027-06-19 ❌ 是 2026 端午; 正确: 2026 端午=`2026-06-19` (周五), 2027 端午=`2027-06-09` (周三), 2026 中秋=`2026-09-25`, 2027 中秋=`2027-09-15`. 长假 (春节/五一/国庆) 因官方调休年年变, 也需逐年核对国务院通知
+- **CMD 粘贴排坑 (Windows)** ⚠️: 实测出现过"粘贴命令后自动跑了两遍"现象. 代码里 `asyncio.run(main())` 跑完即退出无重启逻辑, 必然是**剪贴板带了多行换行**导致 cmd 顺序执行多次. 排查: `doskey /history` 查重复; 防坑: 复制后先粘到记事本确认 / 直接手敲 / Windows Terminal 多行警告时点取消
 - **未实施的进一步优化** (用户已明确不做): Tier 分层 / 缩天数 (维持全量 365 天 × 全部酒店); 待验证: 整合档实测稳定性 (REQUEST_DELAY_MS 缩短后 Akamai 是否限流, rotate_every_n 16 后单批失败影响面)
