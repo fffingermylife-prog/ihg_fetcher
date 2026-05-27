@@ -50,9 +50,16 @@ USER_DATA_DIR = "./ihg_browser_profile"
 API_KEY = "se9ym5iAzaW8pxfBjkmgbuGjJcr3Pj6Y"
 POINTS_RATE_PLAN_CODES = ["IVAN1", "IVAN3", "IVAN5", "IVAN6", "IVAN7", "IVANI"]
 
-WINDOW_SIZE_DAYS = 62
-REQUEST_DELAY_MS = (200, 500)  # 随机延迟区间 (毫秒)
-MAX_RETRIES = 1
+# ============ 运行时参数 (整合档 A3+B1: 启动时从 notify_config.json runtime 段读取覆盖) ============
+# 这些是默认值, main() 启动时会调用 load_runtime_config() 用 config 文件覆盖
+WINDOW_SIZE_DAYS = 62          # 单次 API 调用日期跨度
+REQUEST_DELAY_MS = (100, 300)  # 随机延迟区间 (毫秒, 整合档 A2: 200~500 → 100~300)
+MAX_RETRIES = 1                # 单酒店内部失败重试次数 (本批次内立即重试)
+HOTEL_FETCH_TIMEOUT = 120      # 单酒店 fetch_hotel_prices 整体超时秒数
+MAX_BATCH_ATTEMPTS = 3         # 跨批次最大尝试次数 (失败酒店换节点重试)
+
+# 这些参数由 main() 局部使用, 但默认值放这里集中管理
+DEFAULT_CONCURRENCY = 3              # 默认并发 Tab 数
 
 # 数据目录
 DATA_DIR = "./ihg_data"
@@ -69,6 +76,52 @@ sys.stdout.reconfigure(line_buffering=True)
 
 
 # ============ 工具函数 ============
+
+def load_runtime_config():
+    """从 notify_config.json 的 runtime 段读取参数, 覆盖 module 默认值
+
+    整合档 A3+B1: 把 WINDOW_SIZE_DAYS / REQUEST_DELAY_MS / MAX_RETRIES /
+    HOTEL_FETCH_TIMEOUT / MAX_BATCH_ATTEMPTS 等运行时参数集中到 notify_config.json,
+    改参不用改 .py 文件; 命令行 --concurrency 优先于 config 中的 concurrency。
+
+    Returns:
+        dict: {"concurrency": int}  仅返回 main() 需要的默认值, 其余参数通过 global 改本模块常量
+    """
+    global WINDOW_SIZE_DAYS, REQUEST_DELAY_MS, MAX_RETRIES
+    global HOTEL_FETCH_TIMEOUT, MAX_BATCH_ATTEMPTS
+
+    runtime_out = {"concurrency": DEFAULT_CONCURRENCY}
+
+    cfg_path = Path(__file__).parent / "notify_config.json"
+    if not cfg_path.exists():
+        return runtime_out
+
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        rt = cfg.get("runtime", {})
+        if not isinstance(rt, dict):
+            return runtime_out
+
+        if "window_size_days" in rt:
+            WINDOW_SIZE_DAYS = int(rt["window_size_days"])
+        delay_min = rt.get("request_delay_ms_min")
+        delay_max = rt.get("request_delay_ms_max")
+        if delay_min is not None and delay_max is not None:
+            REQUEST_DELAY_MS = (int(delay_min), int(delay_max))
+        if "max_retries" in rt:
+            MAX_RETRIES = int(rt["max_retries"])
+        if "hotel_fetch_timeout_sec" in rt:
+            HOTEL_FETCH_TIMEOUT = int(rt["hotel_fetch_timeout_sec"])
+        if "max_batch_attempts" in rt:
+            MAX_BATCH_ATTEMPTS = int(rt["max_batch_attempts"])
+        if "concurrency" in rt:
+            runtime_out["concurrency"] = int(rt["concurrency"])
+    except Exception as e:
+        print(f"[!] 读取 runtime 配置失败 (用默认值): {e}")
+
+    return runtime_out
+
 
 def iter_date_windows(start_date, total_days, window_size):
     """生成滑动窗口日期区间"""
@@ -641,7 +694,7 @@ async def worker(worker_id, page, batch_queue, results, requeue, windows, dry_ru
                 try:
                     prices = await asyncio.wait_for(
                         fetch_hotel_prices(page, hotel_code, windows),
-                        timeout=120
+                        timeout=HOTEL_FETCH_TIMEOUT
                     )
                     success = True
                     break
@@ -1018,6 +1071,10 @@ def format_change_detail(item):
 # ============ 主逻辑 ============
 
 async def main():
+    # 整合档 A3+B1: 启动时读取 notify_config.json 的 runtime 段, 覆盖 module 常量
+    # (WINDOW_SIZE_DAYS / REQUEST_DELAY_MS / MAX_RETRIES / HOTEL_FETCH_TIMEOUT / MAX_BATCH_ATTEMPTS)
+    runtime_cfg = load_runtime_config()
+
     parser = argparse.ArgumentParser(description="IHG 多酒店批量价格监控")
     parser.add_argument("--codes", type=str, default=None,
                         help="酒店代码, 逗号分隔 (如 HPHHL,SGNVC,HANHC)")
@@ -1029,8 +1086,8 @@ async def main():
                         help="从 SQLite 数据库读取酒店代码")
     parser.add_argument("--country", type=str, default=None,
                         help="配合 --from-db 按国家筛选酒店")
-    parser.add_argument("--concurrency", type=int, default=3,
-                        help="并发 Tab 数 (默认 3, 最大 3)")
+    parser.add_argument("--concurrency", type=int, default=runtime_cfg["concurrency"],
+                        help=f"并发 Tab 数 (默认 {runtime_cfg['concurrency']}, 最大 3, 来自 notify_config.json runtime.concurrency)")
     parser.add_argument("--incremental", action="store_true",
                         help="增量模式: 只获取最远 62 天窗口")
     parser.add_argument("--days", type=int, default=365,
@@ -1100,6 +1157,7 @@ async def main():
     print(f"  模式: {mode_str} | 并发: {concurrency} Tab | 酒店: {len(hotel_codes)} 个")
     print(f"  日期: {windows[0][0]} ~ {windows[-1][1]} ({len(windows)} 个窗口)")
     print(f"  每酒店请求: 现金 {len(windows)} 次 + 积分 {len(windows)} 次")
+    print(f"  运行时: 延迟 {REQUEST_DELAY_MS[0]}~{REQUEST_DELAY_MS[1]}ms | 单酒店超时 {HOTEL_FETCH_TIMEOUT}s | 内部重试 {MAX_RETRIES} | 跨批重试上限 {MAX_BATCH_ATTEMPTS}")
     if clash_mgr:
         print(f"  批次模式: 每批 {batch_size} 个酒店 → 关 context + 切节点 + 重建 (估 {est_batches} 批)")
     else:
@@ -1183,7 +1241,7 @@ async def main():
     total_index_map = {code: (idx, len(hotel_codes)) for idx, code in enumerate(hotel_codes, 1)}
 
     # 跨批次尝试计数 (避免一个酒店被反复重试无限循环)
-    MAX_BATCH_ATTEMPTS = 3
+    # MAX_BATCH_ATTEMPTS 由整合档 A3+B1 移至 module 级常量, 通过 notify_config.json runtime 段配置
     attempt_count = {code: 0 for code in hotel_codes}
     abandoned = []   # 超过 MAX_BATCH_ATTEMPTS 后放弃的酒店
 
