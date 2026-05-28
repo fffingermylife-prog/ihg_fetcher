@@ -70,8 +70,8 @@
 
   "clash": {
     "_说明": "rotate_every_n 在批次重建模式下表示『每批多少个酒店』, 一批结束后会关 context + 切节点 + 重建; 数值越大切换次数越少, 但单批失败影响面越大. 整合档 A1: 8 → 16 减半批次重建开销. 后续 16 → 18 (=concurrency 3 × 6 round, 避免最后一轮 Tab 空闲)",
-    "api_url": "http://127.0.0.1:56285",
-    "secret": "你的secret填这里",
+    "api_url": "http://127.0.0.1:57829",
+    "secret": "fcacd415-ec0b-4b16-bb65-0aeb67ccab5f",
     "proxy_group": "GLOBAL",
     "rotate_every_n": 18,
     "only_flag_emoji": true,
