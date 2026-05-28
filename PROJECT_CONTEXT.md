@@ -114,6 +114,11 @@ if cpp >= min_cpp and points and points_ok and cash_ok:
 - 每个币种汇率仅查询一次 (run-level 缓存)
 - CPP 全球可比, 不再被本地币面值 (如 MYR/JPY) 误导
 - 通知中只显示 USD 价 (精简格式)
+- ⚠️ **必须取 source=P** (✨ 关键修复): IHG 接口对 CNY/EUR 等"品牌定制汇率"币种会同时返回两条:
+  - `source=K`: 品牌专用, 实测 CNY 的 K 源停留在 2022-11 的过期值 11.4745, 大陆酒店 USD 虚高 ~78 倍
+  - `source=P`: 官方主源, 才是当前实时汇率 (CNY 实测 0.14649)
+  - 修复: `fetch_usd_rate` 优先取 `source=P`, fallback `results[0]`; 加 sanity check `(1e-7, 5)` 兜底
+  - 工具脚本 `fix_currency_rates.py`: 用最新 P 源汇率 一次性重算 DB 历史污染数据 (自动备份 + `--dry-run` 预览)
 
 #### 4.5 基准均价策略
 - 统一用本次快照平日均价 (周一~周四 + 非节假日)
