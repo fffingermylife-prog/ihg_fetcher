@@ -30,7 +30,6 @@ IHG Clash 代理自动切换模块
 
     mgr = ClashProxyManager()  # 自动读取配置
     mgr.rotate()               # 随机切换节点
-    mgr.on_failure()           # 失败时切换
     print(mgr.current_node)    # 当前节点名
 
     # 独立运行测试
@@ -112,9 +111,7 @@ class ClashProxyManager:
         # 状态
         self.available_nodes = []    # 可用节点列表
         self.current_node = None     # 当前选中节点
-        self.hotel_count = 0         # 已处理酒店计数 (供主流程参考, 不再触发自动切换)
         self.switch_count = 0        # 切换次数统计
-        self.fail_count = 0          # 连续失败计数
 
         # 初始化: 获取可用节点列表
         self._refresh_nodes()
@@ -227,7 +224,6 @@ class ClashProxyManager:
 
             self.current_node = node_name
             self.switch_count += 1
-            self.fail_count = 0  # 重置连续失败计数
             print(f"[Clash] 切换节点: {old} → {node_name} (第{self.switch_count}次)")
 
             # 3. 短暂等待 Clash 内部路由更新
@@ -265,28 +261,6 @@ class ClashProxyManager:
             return False
         return self._switch_to(node)
 
-    def on_hotel_done(self):
-        """
-        每完成一个酒店后调用 (仅做计数, 不再触发自动切换)
-
-        在批次重建模式下, 节点切换由主流程在批次边界统一控制
-        (一个批次 = 一个 BrowserContext = 一个节点), 不再每 N 个酒店内部切换。
-        本方法保留只是为了兼容性和可观测统计。
-        """
-        self.hotel_count += 1
-        return False
-
-    def on_failure(self):
-        """
-        请求失败时调用 (仅记录失败次数, 不再立即切换节点)
-
-        Step 2 优化后的批次模式: 单个酒店失败不再中止整批 (失败延迟集中重试),
-        失败酒店进入 requeue 后续批次重试; 主流程在每批结束后正常 rotate() 切节点,
-        因此 on_failure 在此处只是计数, 不主动切换.
-        """
-        self.fail_count += 1
-        return False
-
     def get_current(self):
         """获取当前节点名"""
         self._refresh_nodes()
@@ -307,7 +281,6 @@ class ClashProxyManager:
             "current_node": self.current_node,
             "available_count": len(self.available_nodes),
             "switch_count": self.switch_count,
-            "hotel_count": self.hotel_count,
             "rotate_every_n": self.rotate_every_n,
         }
 

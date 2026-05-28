@@ -199,8 +199,30 @@ def load_hotel_codes(args):
 
 # ============ API 调用 ============
 
+class FetchError(Exception):
+    """Calendar API 请求失败 (HTTP 错误 / 超时 / 网络异常 / 数据缺失)
+
+    设计意图 (修 Bug 1+2):
+        - 旧版 fetch_calendar 失败时返回 None, parse_cash/parse_points 静默吞成空 list,
+          导致 compare_prices 把"请求失败的 60 天"全部对比成"售罄", 触发大量假阳性推送.
+        - 新版改为抛 FetchError, 让上层 fetch_hotel_prices 在 window 级别重试,
+          重试仍失败则把整个酒店标记失败 (走 requeue), 绝不让"局部失败"污染 compare 数据.
+        - asyncio.gather 默认行为: 任一 task 抛异常 → 立即取消其他 task 并向上抛,
+          这正好保证现金 / 积分 必须双双成功才记入数据 (修 Bug 2).
+    """
+    pass
+
+
 async def fetch_calendar(page, hotel_code, start_date, end_date, points_mode=False):
-    """在浏览器上下文中调用 Calendar API"""
+    """在浏览器上下文中调用 Calendar API
+
+    Returns:
+        dict: API 响应数据 (成功且数据非空时)
+
+    Raises:
+        FetchError: HTTP 非 2xx / 超时 / 网络异常 / 返回 data 为 null
+                    上层必须重试或把整个酒店标记失败, 绝不能当成"该酒店无数据".
+    """
     if points_mode:
         payload = {
             "hotelMnemonics": [hotel_code],
@@ -272,7 +294,19 @@ async def fetch_calendar(page, hotel_code, start_date, end_date, points_mode=Fal
 
     if result.get("ok") and result.get("data"):
         return result["data"]
-    return None
+
+    # 失败: 抛 FetchError 让上层处理 (重试或标记酒店失败)
+    # 不再返回 None, 防止被 parse_cash/parse_points 静默吞成空数据 → compare 误判售罄
+    mode_str = "points" if points_mode else "cash"
+    if not result.get("ok"):
+        raise FetchError(
+            f"calendar API failed: hotel={hotel_code} {start_date}~{end_date} "
+            f"mode={mode_str} status={result.get('status')} "
+            f"err={str(result.get('error', ''))[:80]}"
+        )
+    raise FetchError(
+        f"calendar API empty data: hotel={hotel_code} {start_date}~{end_date} mode={mode_str}"
+    )
 
 
 # ============ 汇率转换 (本地币 → USD) ============
@@ -427,18 +461,50 @@ async def fetch_hotel_prices(page, hotel_code, windows):
     - 项目历史: 同 page 6 路并发会被 Akamai 限流, 但 2 路并发安全 (有头浏览器 + 完整 session)
     - 单酒店耗时: 旧版 12 次串行 ~8s → 新版 6 次配对并发 ~4s, 节省 ~50%
     - wait_for_timeout 也从 12 次降到 6 次 (每对配对之间一次)
+
+    Bug 1+2 修复: window 级重试机制
+    - 旧版: fetch_calendar 失败返回 None → parse 返回空 list → compare 误判"售罄"
+    - 新版: fetch_calendar 失败抛 FetchError → window 级重试 1 次 → 仍失败抛给上层 worker
+            (worker 的 MAX_RETRIES 会触发整酒店重试, 不行则进 requeue 下批新节点重试)
+    - asyncio.gather 默认: 任一抛异常 → 取消另一个并向上抛
+            ⇒ 现金/积分必须双双成功才入数据, 绝不会出现"现金有数据积分空" 的脏数据
     """
+    WINDOW_RETRIES = 1  # 单 window 经历"配对 fetch 失败"后的重试次数 (1 = 总共试 2 次)
+
     all_cash = []
     all_points = []
 
     # 现金 + 积分配对并发: 每个窗口同时发 2 个请求, 等两者都返回再进入下一窗口
     for ws, we in windows:
-        cash_resp, points_resp = await asyncio.gather(
-            fetch_calendar(page, hotel_code, ws, we, points_mode=False),
-            fetch_calendar(page, hotel_code, ws, we, points_mode=True),
-        )
-        all_cash.extend(parse_cash(cash_resp))
-        all_points.extend(parse_points(points_resp))
+        last_err = None
+        for attempt in range(WINDOW_RETRIES + 1):
+            try:
+                cash_resp, points_resp = await asyncio.gather(
+                    fetch_calendar(page, hotel_code, ws, we, points_mode=False),
+                    fetch_calendar(page, hotel_code, ws, we, points_mode=True),
+                )
+                # 双方都成功才入数据
+                all_cash.extend(parse_cash(cash_resp))
+                all_points.extend(parse_points(points_resp))
+                last_err = None
+                break  # 成功
+            except FetchError as e:
+                last_err = e
+                if attempt < WINDOW_RETRIES:
+                    # 等待后重试该 window (避开瞬时限流/网络抖动)
+                    await page.wait_for_timeout(random.randint(2000, 4000))
+                # else: 走出循环, 下面统一抛
+            except Exception as e:
+                # 其他异常 (页面崩溃 / 浏览器断开等) 也按 fetch 失败处理
+                last_err = FetchError(f"unexpected error: {type(e).__name__}: {str(e)[:80]}")
+                if attempt < WINDOW_RETRIES:
+                    await page.wait_for_timeout(random.randint(2000, 4000))
+
+        if last_err is not None:
+            # 该 window 经重试仍失败 → 抛出, 让上层 worker 把整个酒店标记失败重试
+            # 这样比"局部数据 + 全部当售罄"安全得多
+            raise FetchError(f"window {ws}~{we} failed after {WINDOW_RETRIES + 1} attempts: {last_err}")
+
         await page.wait_for_timeout(random.randint(*REQUEST_DELAY_MS))
 
     # 合并
@@ -590,6 +656,33 @@ def get_db():
 # 酒店名缓存 (避免每次都查 db)
 _hotel_name_cache = {}
 
+# notify_config.json 全文缓存 (Bug 8/9 修复: 旧版每个酒店都会重新打开 JSON, N 个酒店 N 次磁盘 IO)
+_notify_config_cache = None
+
+
+def _get_notify_config():
+    """一次性加载 notify_config.json 并缓存到内存
+
+    Returns:
+        dict: notify_config.json 内容; 文件不存在或解析失败时返回 {} (空 dict)
+    """
+    global _notify_config_cache
+    if _notify_config_cache is not None:
+        return _notify_config_cache
+
+    cfg_path = Path(__file__).parent / "notify_config.json"
+    if not cfg_path.exists():
+        _notify_config_cache = {}
+        return _notify_config_cache
+
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            _notify_config_cache = json.load(f)
+    except Exception:
+        _notify_config_cache = {}
+
+    return _notify_config_cache
+
 
 def get_hotel_name(hotel_code):
     """获取酒店名称 (优先 notify_config.json 的 note 备注, 然后是 db 里的 name)
@@ -600,18 +693,10 @@ def get_hotel_name(hotel_code):
 
     name = ""
     # 1) 优先用 notify_config.json 里的 note (用户自己起的中文别名)
-    try:
-        import json as _json
-        from pathlib import Path as _P
-        cfg_path = _P(__file__).parent / "notify_config.json"
-        if cfg_path.exists():
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = _json.load(f)
-            note = cfg.get("hotels", {}).get(hotel_code, {}).get("note", "")
-            if note:
-                name = note
-    except Exception:
-        pass
+    cfg = _get_notify_config()
+    note = cfg.get("hotels", {}).get(hotel_code, {}).get("note", "")
+    if note:
+        name = note
 
     # 2) 再用数据库里的 name
     if not name:
@@ -1306,12 +1391,16 @@ async def main():
             results.extend(batch_results)
             batch_elapsed = time.time() - t_batch
 
-            # 失败/未完成的放回队首 (优先在下个批次/新节点重试)
+            # 失败/未完成的放回队尾 (Bug 5 修复: 旧版放队首会导致每批先死同一个酒店)
+            # 新版放队尾的好处:
+            #   - 失败酒店等剩余正常酒店先跑完, 再到下批新节点重试
+            #   - 避免"一个真死的酒店每批都先消耗 timeout 再放弃" 的浪费
+            #   - 新节点对失败酒店来说是"全新机会", 不需要优先调度
             if batch_requeue:
                 # 去重防御 (同一 code 不会同时出现在 results 和 requeue, 但保险一下)
                 seen_in_results = {r["hotel_code"] for r in batch_results}
                 actually_requeue = [c for c in batch_requeue if c not in seen_in_results]
-                remaining = actually_requeue + remaining
+                remaining = remaining + actually_requeue
                 print(f"[批次 {batch_num}] 完成 {len(batch_results)}/{len(batch)} | "
                       f"放回 {len(actually_requeue)} 个待重试 | 耗时 {batch_elapsed:.1f}s")
             else:
