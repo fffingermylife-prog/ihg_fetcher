@@ -280,7 +280,7 @@ DEFAULT_RULES = _build_default_rules()  # 自动从表生成 file/push 默认值
 | 积分 payload | `guestCounts`: 只 AQC10, `includeSellStrategy: "followChannel"`, `rates.ratePlanCodes` |
 | 积分 codes | `["IVAN1","IVAN3","IVAN5","IVAN6","IVAN7","IVANI"]` |
 | 日期区间 | API 返回合并区间 (start/end), 连续相同价格的天被压缩 |
-| 窗口大小 | 62 天 (和官网一致) |
+| 窗口大小 | 62 天 (和官网一致) — **已实测 (2026-05-27)**: API 单次最大返回 62~63 天, 上调 75/92/100+ 均失败, 不可扩 |
 | 最远日期 | 约 349 天 (从今天算) |
 | 新日期开放 | 约 UTC 23:00~0:00 (中国时间 07:00~08:00) 每天新增一天 |
 | 批量请求 | `hotelMnemonics` 传多个代码返回 400, **不可行** |
